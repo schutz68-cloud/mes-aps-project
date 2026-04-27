@@ -3,52 +3,57 @@ import Gantt from "./Gantt";
 
 const MOVE_DEBOUNCE_MS = 350;
 
+// Временная роль до полноценной авторизации.
+// production_manager может изменять frozen zone.
+// dispatcher только видит настройку.
+const CURRENT_USER_ROLE = "production_manager";
+
 function App() {
   const [ops, setOps] = useState([]);
   const [changeLog, setChangeLog] = useState([]);
   const [showHistory, setShowHistory] = useState(false);
+  const [freezeHorizonMinutes, setFreezeHorizonMinutes] = useState(0);
+  const [freezeInput, setFreezeInput] = useState("");
 
-  const moveDebounceRef = useRef(new Map()); // key: op.id -> { timer, controller, resolve }
+  const moveDebounceRef = useRef(new Map());
 
-  // ======================
-  // LOAD OPERATIONS
-  // ======================
+  const canEditFreezeZone = CURRENT_USER_ROLE === "production_manager";
+
   const loadOperations = useCallback(() => {
     fetch("http://127.0.0.1:8000/operations")
       .then((res) => res.json())
       .then((data) => {
         setOps(Array.isArray(data) ? data : []);
       })
-      .catch(() => {
-        // при необходимости можно добавить UI-уведомление
-      });
+      .catch(() => {});
   }, []);
 
-  // ======================
-  // LOAD CHANGE LOG
-  // ======================
   const loadChangeLog = useCallback(() => {
     fetch("http://127.0.0.1:8000/plan_change_log?limit=20")
       .then((res) => res.json())
       .then((data) => {
         setChangeLog(Array.isArray(data) ? data : []);
       })
-      .catch(() => {
-        // при необходимости можно добавить UI-уведомление
-      });
+      .catch(() => {});
   }, []);
 
-  // ======================
-  // INITIAL LOAD
-  // ======================
+  const loadFreezeHorizon = useCallback(() => {
+    fetch("http://127.0.0.1:8000/settings/freeze_horizon")
+      .then((res) => res.json())
+      .then((data) => {
+        const minutes = Number(data.freeze_horizon_minutes ?? 0);
+        setFreezeHorizonMinutes(minutes);
+        setFreezeInput(String(minutes));
+      })
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     loadOperations();
     loadChangeLog();
-  }, [loadOperations, loadChangeLog]);
+    loadFreezeHorizon();
+  }, [loadOperations, loadChangeLog, loadFreezeHorizon]);
 
-  // ======================
-  // WEBSOCKET UPDATES
-  // ======================
   useEffect(() => {
     let disposed = false;
     const ws = new WebSocket("ws://127.0.0.1:8000/ws");
@@ -70,11 +75,15 @@ function App() {
 
         loadChangeLog();
       }
+      if (msg.type === "settings_update") {
+        const minutes = Number(msg.data.freeze_horizon_minutes ?? 0);
+
+        setFreezeHorizonMinutes(minutes);
+        setFreezeInput(String(minutes));
+      }
     };
 
-    ws.onerror = () => {
-      // без лишних логов
-    };
+    ws.onerror = () => {};
 
     return () => {
       disposed = true;
@@ -89,9 +98,6 @@ function App() {
     };
   }, [loadChangeLog]);
 
-  // ======================
-  // CLEANUP DEBOUNCE
-  // ======================
   useEffect(() => {
     return () => {
       for (const entry of moveDebounceRef.current.values()) {
@@ -104,9 +110,6 @@ function App() {
     };
   }, []);
 
-  // ======================
-  // MOVE FROM GANTT
-  // ======================
   const handleMove = useCallback(
     (op) => {
       return new Promise((resolve, reject) => {
@@ -130,7 +133,24 @@ function App() {
               signal: controller.signal,
             });
 
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            if (!res.ok) {
+              let errorData = null;
+
+              try {
+                errorData = await res.json();
+              } catch {
+                errorData = null;
+              }
+
+              const message =
+                errorData?.detail?.message ||
+                errorData?.detail ||
+                `HTTP ${res.status}`;
+
+              throw new Error(
+                typeof message === "string" ? message : JSON.stringify(message)
+              );
+            }
 
             loadChangeLog();
 
@@ -153,12 +173,7 @@ function App() {
     [loadChangeLog]
   );
 
-  // ======================
-  // ROLLBACK
-  // ======================
   const handleRollback = useCallback(async () => {
-    console.log("↩️ Откатить последнюю операцию");
-
     try {
       const res = await fetch("http://127.0.0.1:8000/rollback_last_change", {
         method: "POST",
@@ -166,10 +181,8 @@ function App() {
 
       const data = await res.json();
 
-      console.log("↩️ ROLLBACK RESPONSE:", data);
-
       if (!res.ok) {
-        alert("Rollback failed: " + JSON.stringify(data));
+        alert("Откат не выполнен: " + JSON.stringify(data));
         return;
       }
 
@@ -183,16 +196,62 @@ function App() {
 
       loadChangeLog();
     } catch (error) {
-      console.error("↩️ ROLLBACK ERROR:", error);
-      alert("Rollback request failed");
+      console.error("Ошибка отката:", error);
+      alert("Не удалось выполнить откат");
     }
   }, [loadChangeLog]);
+
+  const handleSaveFreezeHorizon = useCallback(async () => {
+    const minutes = Number(freezeInput);
+
+    if (!Number.isInteger(minutes) || minutes < 0) {
+      alert("Горизонт заморозки должен быть целым неотрицательным числом");
+      return;
+    }
+
+    try {
+      const res = await fetch("http://127.0.0.1:8000/settings/freeze_horizon", {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "X-User-Role": CURRENT_USER_ROLE,
+        },
+        body: JSON.stringify({ minutes }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        alert(
+          "Не удалось изменить горизонт заморозки: " +
+            (data?.detail || JSON.stringify(data))
+        );
+        return;
+      }
+
+      setFreezeHorizonMinutes(data.freeze_horizon_minutes);
+      setFreezeInput(String(data.freeze_horizon_minutes));
+
+      alert("Горизонт заморозки обновлён");
+    } catch (error) {
+      console.error("Ошибка изменения горизонта заморозки:", error);
+      alert("Не удалось изменить горизонт заморозки");
+    }
+  }, [freezeInput]);
 
   return (
     <div style={{ padding: "20px" }}>
       <h2>APS Gantt</h2>
 
-      <div style={{ display: "flex", gap: "12px", marginBottom: "12px" }}>
+      <div
+        style={{
+          display: "flex",
+          gap: "12px",
+          marginBottom: "12px",
+          alignItems: "center",
+          flexWrap: "wrap",
+        }}
+      >
         <button
           onClick={handleRollback}
           style={{
@@ -220,16 +279,49 @@ function App() {
           {showHistory ? "Скрыть историю изменений" : "История изменений"}
         </button>
 
-        {/* <button
-          onClick={loadChangeLog}
+        <div
           style={{
-            padding: "8px 12px",
-            cursor: "pointer",
+            display: "flex",
+            gap: "8px",
+            alignItems: "center",
+            padding: "8px",
+            border: "1px solid #ccc",
           }}
         >
-          Обновить историю
-        </button> */}
+          <span>Frozen zone:</span>
+
+          <input
+            type="number"
+            value={freezeInput}
+            disabled={!canEditFreezeZone}
+            onChange={(e) => setFreezeInput(e.target.value)}
+            style={{ width: "90px", padding: "6px" }}
+          />
+
+          <span>мин.</span>
+
+          <button
+            onClick={handleSaveFreezeHorizon}
+            disabled={!canEditFreezeZone}
+            style={{
+              padding: "6px 10px",
+              cursor: canEditFreezeZone ? "pointer" : "not-allowed",
+            }}
+          >
+            Сохранить
+          </button>
+
+          {!canEditFreezeZone && (
+            <span style={{ color: "#777" }}>
+              Изменять может только начальник производства
+            </span>
+          )}
+        </div>
       </div>
+
+      {/* <div style={{ marginBottom: "12px", color: "#555" }}>
+        Текущий горизонт заморозки: {freezeHorizonMinutes} мин.
+      </div> */}
 
       {showHistory && (
         <div
@@ -310,7 +402,11 @@ function App() {
         </div>
       )}
 
-      <Gantt data={ops} onMove={handleMove} />
+      <Gantt
+        data={ops}
+        onMove={handleMove}
+        freezeHorizonMinutes={freezeHorizonMinutes}
+      />
     </div>
   );
 }

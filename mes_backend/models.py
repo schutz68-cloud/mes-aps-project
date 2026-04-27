@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, func
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, func
 from sqlalchemy.ext.declarative import declarative_base
 
 Base = declarative_base()
@@ -37,3 +37,12 @@ class PlanChangeLog(Base):
     is_rolled_back = Column(Boolean, default=False)
     rollback_at = Column(DateTime)
     rollback_reason = Column(String)
+
+
+class SystemSetting(Base):
+    __tablename__ = "system_settings"
+
+    key = Column(String, primary_key=True)
+    value = Column(String)
+    description = Column(String)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

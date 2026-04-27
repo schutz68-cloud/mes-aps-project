@@ -1,11 +1,61 @@
-from fastapi import FastAPI, WebSocket, Request, HTTPException
+from fastapi import FastAPI, WebSocket, HTTPException, Header
+from pydantic import BaseModel
+from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
 from db import SessionLocal
-from models import PlanOperation, PlanChangeLog
+from models import PlanOperation, PlanChangeLog, SystemSetting
 from websocket import connect, disconnect, broadcast_sync
 from sqlalchemy import text
 
+
 app = FastAPI(title="MES APS Backend")
+
+
+# ======================
+# REQUEST MODELS
+# ======================
+class OperationUpdatePayload(BaseModel):
+    id: Optional[int] = None
+    machine: str
+    start: int
+    end: int
+
+
+class FreezeHorizonPayload(BaseModel):
+    minutes: int
+
+
+# ======================
+# APS SETTINGS
+# ======================
+DEFAULT_FREEZE_HORIZON_MINUTES = 200
+FREEZE_HORIZON_SETTING_KEY = "freeze_horizon_minutes"
+PRODUCTION_MANAGER_ROLE = "production_manager"
+
+
+def get_freeze_horizon_minutes(db) -> int:
+    setting = (
+        db.query(SystemSetting)
+        .filter(SystemSetting.key == FREEZE_HORIZON_SETTING_KEY)
+        .first()
+    )
+
+    if not setting:
+        setting = SystemSetting(
+            key=FREEZE_HORIZON_SETTING_KEY,
+            value=str(DEFAULT_FREEZE_HORIZON_MINUTES),
+            description="Горизонт заморозки плана в минутах от начала планового горизонта",
+        )
+        db.add(setting)
+        db.commit()
+        db.refresh(setting)
+
+    try:
+        return int(setting.value)
+    except (TypeError, ValueError):
+        return DEFAULT_FREEZE_HORIZON_MINUTES
+
+
 # ======================
 # CORS
 # ======================
@@ -34,10 +84,75 @@ async def websocket_endpoint(ws: WebSocket):
     await connect(ws)
     try:
         while True:
-            # Держим соединение живым
             await ws.receive_text()
     except Exception:
         await disconnect(ws)
+
+
+# ======================
+# GET FREEZE HORIZON
+# ======================
+@app.get("/settings/freeze_horizon")
+def get_freeze_horizon():
+    db = SessionLocal()
+    try:
+        minutes = get_freeze_horizon_minutes(db)
+        return {"freeze_horizon_minutes": minutes}
+    finally:
+        db.close()
+
+
+# ======================
+# UPDATE FREEZE HORIZON
+# ======================
+@app.put("/settings/freeze_horizon")
+async def update_freeze_horizon(
+    payload: FreezeHorizonPayload,
+    x_user_role: Optional[str] = Header(default=None),
+):
+    if x_user_role != PRODUCTION_MANAGER_ROLE:
+        raise HTTPException(
+            status_code=403,
+            detail="Изменять горизонт заморозки может только начальник производства",
+        )
+
+    if payload.minutes < 120:
+        raise HTTPException(
+            status_code=400,
+            detail="Горизонт заморозки не может быть меньше 120 минут",
+        )
+
+    db = SessionLocal()
+    try:
+        setting = (
+            db.query(SystemSetting)
+            .filter(SystemSetting.key == FREEZE_HORIZON_SETTING_KEY)
+            .first()
+        )
+
+        if not setting:
+            setting = SystemSetting(
+                key=FREEZE_HORIZON_SETTING_KEY,
+                value=str(payload.minutes),
+                description="Горизонт заморозки плана в минутах от начала планового горизонта",
+            )
+            db.add(setting)
+        else:
+            setting.value = str(payload.minutes)
+
+        db.commit()
+        event = {
+            "type": "settings_update",
+            "data": {
+                "freeze_horizon_minutes": payload.minutes
+            },
+        }       
+
+        broadcast_sync(event)
+        return {"status": "ok", "freeze_horizon_minutes": payload.minutes}
+
+    finally:
+        db.close()
 
 
 # ======================
@@ -63,43 +178,25 @@ def get_operations():
 
 # ======================
 # UPDATE FROM GANTT (DRAG)
-# Валидация: start < end, machine не пустой
-# Поддержка переноса между станками
 # ======================
 @app.post("/update_op/{op_id}")
-async def update_operation(op_id: int, request: Request):
+async def update_operation(op_id: int, payload: OperationUpdatePayload):
     db = SessionLocal()
     try:
-        payload = await request.json()
-
-        # 1) Проверка обязательных полей
-        required_fields = ("start", "end", "machine")
-        missing = [f for f in required_fields if f not in payload]
-        if missing:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Missing required field(s): {', '.join(missing)}",
-            )
-
-        # 2) Валидация времени
-        try:
-            start = int(payload["start"])
-            end = int(payload["end"])
-        except (TypeError, ValueError):
-            raise HTTPException(
-                status_code=400, detail="'start' and 'end' must be integers"
-            )
+        start = int(payload.start)
+        end = int(payload.end)
+        machine_raw = payload.machine
 
         if start >= end:
             raise HTTPException(
-                status_code=400, detail="Validation error: start must be < end"
+                status_code=400,
+                detail="Ошибка валидации: время начала должно быть меньше времени окончания",
             )
 
-        # 3) Валидация machine
-        machine_raw = payload["machine"]
         if machine_raw is None:
             raise HTTPException(
-                status_code=400, detail="Validation error: machine must not be empty"
+                status_code=400,
+                detail="Ошибка валидации: станок не должен быть пустым",
             )
 
         if isinstance(machine_raw, str):
@@ -107,40 +204,86 @@ async def update_operation(op_id: int, request: Request):
             if machine_clean == "":
                 raise HTTPException(
                     status_code=400,
-                    detail="Validation error: machine must not be empty",
+                    detail="Ошибка валидации: станок не должен быть пустым",
                 )
         else:
             machine_clean = machine_raw
 
-        # 4) Поиск операции
         op = db.query(PlanOperation).filter(PlanOperation.operation_id == op_id).first()
 
         if not op:
-            raise HTTPException(status_code=404, detail=f"Operation {op_id} not found")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Операция {op_id} не найдена",
+            )
 
-        # 5) Сохраняем старые значения ДО изменения
-        old_plan_version_id = op.plan_version_id
-        old_machine_id = op.machine_id
-        old_start_time = int(op.start_time) if op.start_time is not None else 0
-        old_end_time = int(op.end_time) if op.end_time is not None else 0
+        freeze_horizon_minutes = get_freeze_horizon_minutes(db)
+        current_start_time = int(op.start_time) if op.start_time is not None else 0
 
-        # 6) Безопасное приведение machine к типу поля в БД
+        if current_start_time < freeze_horizon_minutes:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Операция находится в замороженной зоне плана и не может быть перемещена",
+                    "operation_id": op.operation_id,
+                    "machine": op.machine_id,
+                    "current_start": current_start_time,
+                    "freeze_horizon_minutes": freeze_horizon_minutes,
+                },
+            )
+
         if isinstance(op.machine_id, int):
             try:
                 machine_value = int(machine_clean)
             except (TypeError, ValueError):
                 raise HTTPException(
-                    status_code=400, detail="Validation error: machine must be integer"
+                    status_code=400,
+                    detail="Ошибка валидации: станок должен быть числом",
                 )
         else:
             machine_value = str(machine_clean)
 
-        # 7) Обновляем операцию
+        overlapping_op = (
+            db.query(PlanOperation)
+            .filter(PlanOperation.operation_id != op_id)
+            .filter(PlanOperation.machine_id == machine_value)
+            .filter(PlanOperation.start_time < end)
+            .filter(PlanOperation.end_time > start)
+            .first()
+        )
+
+        if overlapping_op:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Операция пересекается с другой операцией на этом же станке",
+                    "machine": machine_value,
+                    "current_operation_id": op_id,
+                    "overlapping_operation_id": overlapping_op.operation_id,
+                    "requested_start": start,
+                    "requested_end": end,
+                    "overlapping_start": (
+                        int(overlapping_op.start_time)
+                        if overlapping_op.start_time is not None
+                        else 0
+                    ),
+                    "overlapping_end": (
+                        int(overlapping_op.end_time)
+                        if overlapping_op.end_time is not None
+                        else 0
+                    ),
+                },
+            )
+
+        old_plan_version_id = op.plan_version_id
+        old_machine_id = op.machine_id
+        old_start_time = int(op.start_time) if op.start_time is not None else 0
+        old_end_time = int(op.end_time) if op.end_time is not None else 0
+
         op.start_time = start
         op.end_time = end
         op.machine_id = machine_value
 
-        # 8) Пишем историю изменений
         change = PlanChangeLog(
             plan_version_id=old_plan_version_id,
             operation_id=op.operation_id,
@@ -157,7 +300,6 @@ async def update_operation(op_id: int, request: Request):
         db.commit()
         db.refresh(op)
 
-        # 9) WebSocket событие
         event = {
             "type": "operation_update",
             "data": {
@@ -200,23 +342,8 @@ async def rollback_last_change():
             print("❌ NO AVAILABLE CHANGES FOR ROLLBACK")
             raise HTTPException(
                 status_code=404,
-                detail="No available changes found for rollback",
+                detail="Нет доступных изменений для отката",
             )
-
-        print(
-            "↩️ LAST CHANGE FOR ROLLBACK:",
-            {
-                "change_id": last_change.id,
-                "operation_id": last_change.operation_id,
-                "old_machine_id": last_change.old_machine_id,
-                "old_start_time": last_change.old_start_time,
-                "old_end_time": last_change.old_end_time,
-                "new_machine_id": last_change.new_machine_id,
-                "new_start_time": last_change.new_start_time,
-                "new_end_time": last_change.new_end_time,
-                "is_rolled_back": last_change.is_rolled_back,
-            },
-        )
 
         op = (
             db.query(PlanOperation)
@@ -228,7 +355,7 @@ async def rollback_last_change():
             print("❌ OPERATION NOT FOUND:", last_change.operation_id)
             raise HTTPException(
                 status_code=404,
-                detail=f"Operation {last_change.operation_id} not found",
+                detail=f"Операция {last_change.operation_id} не найдена",
             )
 
         current_machine_id = op.machine_id
@@ -277,16 +404,6 @@ async def rollback_last_change():
                 "end": int(op.end_time) if op.end_time is not None else 0,
             },
         }
-
-        print("✅ ROLLBACK APPLIED:", event["data"])
-        print(
-            "🧾 ROLLBACK EVENT LOGGED:",
-            {
-                "rollback_log_id": rollback_log.id,
-                "operation_id": rollback_log.operation_id,
-                "change_reason": rollback_log.change_reason,
-            },
-        )
 
         broadcast_sync(event)
 
