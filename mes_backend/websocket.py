@@ -21,8 +21,16 @@ async def disconnect(ws: WebSocket):
 # ASYNC BROADCAST
 # ======================
 async def broadcast(message: dict):
-    for ws in connections:
-        await ws.send_json(message)
+    stale_connections = []
+
+    for ws in list(connections):
+        try:
+            await ws.send_json(message)
+        except Exception:
+            stale_connections.append(ws)
+
+    for ws in stale_connections:
+        await disconnect(ws)
 
 # ======================
 # SYNC WRAPPER (для FastAPI endpoints)

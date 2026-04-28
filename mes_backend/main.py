@@ -2,13 +2,18 @@ from fastapi import FastAPI, WebSocket, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
-from db import SessionLocal
+from db import SessionLocal, init_db_schema
 from models import PlanOperation, PlanChangeLog, SystemSetting
 from websocket import connect, disconnect, broadcast_sync
 from sqlalchemy import text
 
 
 app = FastAPI(title="MES APS Backend")
+
+
+@app.on_event("startup")
+def startup():
+    init_db_schema()
 
 
 # ======================
