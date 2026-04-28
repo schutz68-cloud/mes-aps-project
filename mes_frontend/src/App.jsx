@@ -2,6 +2,21 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Gantt from "./Gantt";
 
 const MOVE_DEBOUNCE_MS = 350;
+const HISTORY_LIMIT = 50;
+const DEFAULT_HISTORY_FILTERS = {
+  operationId: "",
+  machine: "",
+  changeReason: "",
+  rollbackStatus: "",
+};
+
+const OPERATION_NAMES = {
+  COILING: "Навивка",
+  BENDING: "Загиб",
+  FACING: "Торцовка",
+  HEAT: "Термичка",
+  COATING: "Покрытие",
+};
 
 // Временная роль до полноценной авторизации.
 // production_manager может изменять frozen zone.
@@ -14,10 +29,18 @@ function App() {
   const [showHistory, setShowHistory] = useState(false);
   const [freezeHorizonMinutes, setFreezeHorizonMinutes] = useState(0);
   const [freezeInput, setFreezeInput] = useState("");
+  const [historyFilters, setHistoryFilters] = useState(DEFAULT_HISTORY_FILTERS);
+  const [operationFilter, setOperationFilter] = useState("");
 
   const moveDebounceRef = useRef(new Map());
 
   const canEditFreezeZone = CURRENT_USER_ROLE === "production_manager";
+  const operationGroups = Array.from(
+    new Set(ops.map((op) => op.operation_type).filter(Boolean))
+  ).sort();
+  const filteredOps = operationFilter
+    ? ops.filter((op) => op.operation_type === operationFilter)
+    : ops;
 
   const loadOperations = useCallback(() => {
     fetch("http://127.0.0.1:8000/operations")
@@ -29,13 +52,28 @@ function App() {
   }, []);
 
   const loadChangeLog = useCallback(() => {
-    fetch("http://127.0.0.1:8000/plan_change_log?limit=20")
+    const params = new URLSearchParams({ limit: String(HISTORY_LIMIT) });
+
+    if (historyFilters.operationId.trim()) {
+      params.set("operation_id", historyFilters.operationId.trim());
+    }
+    if (historyFilters.machine.trim()) {
+      params.set("machine", historyFilters.machine.trim());
+    }
+    if (historyFilters.changeReason) {
+      params.set("change_reason", historyFilters.changeReason);
+    }
+    if (historyFilters.rollbackStatus) {
+      params.set("rolled_back", historyFilters.rollbackStatus);
+    }
+
+    fetch(`http://127.0.0.1:8000/plan_change_log?${params.toString()}`)
       .then((res) => res.json())
       .then((data) => {
         setChangeLog(Array.isArray(data) ? data : []);
       })
       .catch(() => {});
-  }, []);
+  }, [historyFilters]);
 
   const loadFreezeHorizon = useCallback(() => {
     fetch("http://127.0.0.1:8000/settings/freeze_horizon")
@@ -241,8 +279,6 @@ function App() {
 
   return (
     <div style={{ padding: "20px" }}>
-      <h2>APS Gantt</h2>
-
       <div
         style={{
           display: "flex",
@@ -288,7 +324,7 @@ function App() {
             border: "1px solid #ccc",
           }}
         >
-          <span>Frozen zone:</span>
+          <span>Горизонт заморозки:</span>
 
           <input
             type="number"
@@ -317,11 +353,31 @@ function App() {
             </span>
           )}
         </div>
-      </div>
 
-      {/* <div style={{ marginBottom: "12px", color: "#555" }}>
-        Текущий горизонт заморозки: {freezeHorizonMinutes} мин.
-      </div> */}
+        <div
+          style={{
+            display: "flex",
+            gap: "8px",
+            alignItems: "center",
+            padding: "8px",
+            border: "1px solid #ccc",
+          }}
+        >
+          <span>Группа операций:</span>
+          <select
+            value={operationFilter}
+            onChange={(e) => setOperationFilter(e.target.value)}
+            style={{ padding: "6px" }}
+          >
+            <option value="">Все</option>
+            {operationGroups.map((operationType) => (
+              <option key={operationType} value={operationType}>
+                {OPERATION_NAMES[operationType] || operationType}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
 
       {showHistory && (
         <div
@@ -333,7 +389,80 @@ function App() {
             overflow: "auto",
           }}
         >
-          <h3 style={{ marginTop: 0 }}>Последние 20 изменений</h3>
+          <h3 style={{ marginTop: 0 }}>История изменений</h3>
+
+          <div
+            style={{
+              display: "flex",
+              gap: "8px",
+              marginBottom: "12px",
+              flexWrap: "wrap",
+              alignItems: "center",
+            }}
+          >
+            <input
+              type="number"
+              placeholder="Операция"
+              value={historyFilters.operationId}
+              onChange={(e) =>
+                setHistoryFilters((prev) => ({
+                  ...prev,
+                  operationId: e.target.value,
+                }))
+              }
+              style={{ width: "110px", padding: "6px" }}
+            />
+
+            <input
+              type="text"
+              placeholder="Станок"
+              value={historyFilters.machine}
+              onChange={(e) =>
+                setHistoryFilters((prev) => ({
+                  ...prev,
+                  machine: e.target.value,
+                }))
+              }
+              style={{ width: "110px", padding: "6px" }}
+            />
+
+            <select
+              value={historyFilters.changeReason}
+              onChange={(e) =>
+                setHistoryFilters((prev) => ({
+                  ...prev,
+                  changeReason: e.target.value,
+                }))
+              }
+              style={{ padding: "6px" }}
+            >
+              <option value="">Все типы</option>
+              <option value="manual_gantt_drag">Перемещение</option>
+              <option value="manual_rollback">Откат</option>
+            </select>
+
+            <select
+              value={historyFilters.rollbackStatus}
+              onChange={(e) =>
+                setHistoryFilters((prev) => ({
+                  ...prev,
+                  rollbackStatus: e.target.value,
+                }))
+              }
+              style={{ padding: "6px" }}
+            >
+              <option value="">Любой откат</option>
+              <option value="true">Откат выполнен</option>
+              <option value="false">Без отката</option>
+            </select>
+
+            <button
+              onClick={() => setHistoryFilters(DEFAULT_HISTORY_FILTERS)}
+              style={{ padding: "6px 10px", cursor: "pointer" }}
+            >
+              Сбросить
+            </button>
+          </div>
 
           <table
             style={{
@@ -374,9 +503,9 @@ function App() {
                     <td style={tdStyle}>{row.operation_id}</td>
                     <td style={tdStyle}>
                       {row.change_reason === "manual_gantt_drag"
-                        ? "Drag"
+                        ? "Перемещение"
                         : row.change_reason === "manual_rollback"
-                        ? "Rollback"
+                        ? "Откат"
                         : row.change_reason}
                     </td>
                     <td style={tdStyle}>
@@ -403,7 +532,7 @@ function App() {
       )}
 
       <Gantt
-        data={ops}
+        data={filteredOps}
         onMove={handleMove}
         freezeHorizonMinutes={freezeHorizonMinutes}
       />

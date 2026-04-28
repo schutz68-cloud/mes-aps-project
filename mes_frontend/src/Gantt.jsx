@@ -116,12 +116,16 @@ export default function Gantt({ data, onMove, freezeHorizonMinutes }) {
       const end = Number(op.end);
       const isFrozen = start < freezeHorizon;
 
-      groupMap.set(op.machine, { id: op.machine, content: String(op.machine) });
+      groupMap.set(op.machine, {
+        id: op.machine,
+        content: op.machine_name || String(op.machine),
+      });
 
       items.push({
         id: op.id,
         group: op.machine,
-        content: isFrozen ? `🔒 Op ${op.id}` : `Op ${op.id}`,
+        content: op.label || String(op.id),
+        title: op.operation_name || op.operation_type || "",
         start: start * 60000,
         end: end * 60000,
         type: "range",
@@ -182,18 +186,6 @@ export default function Gantt({ data, onMove, freezeHorizonMinutes }) {
           }
         `}
       </style>
-
-      {/* <div
-        style={{
-          marginBottom: "8px",
-          fontSize: "14px",
-          color: "#555",
-        }}
-      >
-        Красная вертикальная линия — граница замороженной зоны:{" "}
-        {Number(freezeHorizonMinutes ?? 0)} мин.
-      </div> */}
-
       <div
         ref={containerRef}
         style={{ height: "500px", border: "1px solid gray" }}
