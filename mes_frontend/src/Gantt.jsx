@@ -4,6 +4,35 @@ import { DataSet } from "vis-data";
 import "vis-timeline/styles/vis-timeline-graph2d.css";
 
 const FREEZE_LINE_ID = "freeze-horizon-line";
+const MACHINE_GROUP_ORDER = {
+  COIL_A: 10,
+  COIL_B: 11,
+  BEND: 20,
+  FACE: 30,
+  HEAT: 40,
+  COAT_A: 50,
+  COAT_B: 51,
+};
+const ORDER_COLORS = [
+  { setup: "#82b7f0", work: "#d8ebff", border: "#3f7fbd" },
+  { setup: "#90d4a0", work: "#ddf5e3", border: "#4d9b60" },
+  { setup: "#f1bd72", work: "#fff0d8", border: "#c47d21" },
+  { setup: "#c7a0ee", work: "#efe2ff", border: "#8a5ec2" },
+  { setup: "#ee9ca2", work: "#ffe0e3", border: "#bf5962" },
+];
+
+function getOrderColors(orderId, isFrozen) {
+  if (isFrozen) {
+    return {
+      setup: "#9fb0c3",
+      work: "#d9e2ec",
+      border: "#6b7c93",
+    };
+  }
+
+  const index = Math.abs(Number(orderId ?? 1) - 1) % ORDER_COLORS.length;
+  return ORDER_COLORS[index];
+}
 
 export default function Gantt({ data, onMove, freezeHorizonMinutes }) {
   const containerRef = useRef(null);
@@ -36,7 +65,9 @@ export default function Gantt({ data, onMove, freezeHorizonMinutes }) {
       itemsRef.current,
       groupsRef.current,
       {
-        groupOrder: "content",
+        groupOrder: (a, b) =>
+          (a.order ?? 999) - (b.order ?? 999) ||
+          String(a.content).localeCompare(String(b.content), "ru"),
         selectable: true,
         editable: {
           add: false,
@@ -114,21 +145,30 @@ export default function Gantt({ data, onMove, freezeHorizonMinutes }) {
     for (const op of data) {
       const start = Number(op.start);
       const end = Number(op.end);
+      const duration = Math.max(end - start, 1);
+      const setupMinutes = Math.max(Number(op.setup_minutes ?? 0), 0);
+      const setupPercent = Math.min((setupMinutes / duration) * 100, 100);
       const isFrozen = start < freezeHorizon;
+      const colors = getOrderColors(op.order_id, isFrozen);
+      const groupOrder = MACHINE_GROUP_ORDER[op.machine_group_id] ?? 999;
 
       groupMap.set(op.machine, {
         id: op.machine,
         content: op.machine_name || String(op.machine),
+        order: groupOrder,
       });
 
       items.push({
         id: op.id,
         group: op.machine,
         content: op.label || String(op.id),
-        title: op.operation_name || op.operation_type || "",
+        title: `${op.operation_name || op.operation_type || ""}${
+          setupMinutes > 0 ? `, наладка ${setupMinutes} мин.` : ""
+        }`,
         start: start * 60000,
         end: end * 60000,
         type: "range",
+        style: `background: linear-gradient(to right, ${colors.setup} 0%, ${colors.setup} ${setupPercent}%, ${colors.work} ${setupPercent}%, ${colors.work} 100%); border-color: ${colors.border};`,
         className: isFrozen ? "frozen-operation" : "normal-operation",
       });
     }

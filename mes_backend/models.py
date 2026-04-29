@@ -13,12 +13,15 @@ class PlanOperation(Base):
     machine_id = Column(String)
     start_time = Column(Integer)
     end_time = Column(Integer)
+    is_locked = Column(Boolean, default=False)
+    lock_reason = Column(String)
 
 
 class PlanChangeLog(Base):
     __tablename__ = "plan_change_log"
 
     id = Column(Integer, primary_key=True)
+    change_set_id = Column(String)
     plan_version_id = Column(Integer)
     operation_id = Column(Integer)
 
@@ -46,3 +49,11 @@ class SystemSetting(Base):
     value = Column(String)
     description = Column(String)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class RoutingOperationMachineGroup(Base):
+    __tablename__ = "routing_operation_machine_groups"
+
+    id = Column(Integer, primary_key=True)
+    routing_operation_id = Column(Integer)
+    machine_group_id = Column(String)

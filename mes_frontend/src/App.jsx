@@ -113,6 +113,22 @@ function App() {
 
         loadChangeLog();
       }
+      if (msg.type === "plan_operations_updated") {
+        const updates = Array.isArray(msg.data) ? msg.data : [];
+
+        setOps((prev) => {
+          const byId = new Map(prev.map((op) => [op.id, op]));
+
+          for (const update of updates) {
+            const existing = byId.get(update.id);
+            byId.set(update.id, existing ? { ...existing, ...update } : update);
+          }
+
+          return Array.from(byId.values());
+        });
+
+        loadChangeLog();
+      }
       if (msg.type === "settings_update") {
         const minutes = Number(msg.data.freeze_horizon_minutes ?? 0);
 
@@ -239,6 +255,50 @@ function App() {
     }
   }, [loadChangeLog]);
 
+  const handleRollbackChangeSet = useCallback(
+    async (changeSetId) => {
+      try {
+        const res = await fetch(
+          `http://127.0.0.1:8000/plan_change_log/change_set/${changeSetId}/rollback`,
+          { method: "POST" }
+        );
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          const detail = data?.detail?.message || data?.detail;
+          alert(
+            "Не удалось откатить группу изменений: " +
+              (detail || JSON.stringify(data))
+          );
+          return;
+        }
+
+        const updates = Array.isArray(data.updated_operations)
+          ? data.updated_operations
+          : [];
+
+        setOps((prev) => {
+          const byId = new Map(prev.map((op) => [op.id, op]));
+
+          for (const update of updates) {
+            const existing = byId.get(update.id);
+            byId.set(update.id, existing ? { ...existing, ...update } : update);
+          }
+
+          return Array.from(byId.values());
+        });
+
+        loadChangeLog();
+        alert("Группа изменений откатана");
+      } catch (error) {
+        console.error("Ошибка отката группы изменений:", error);
+        alert("Не удалось откатить группу изменений");
+      }
+    },
+    [loadChangeLog]
+  );
+
   const handleSaveFreezeHorizon = useCallback(async () => {
     const minutes = Number(freezeInput);
 
@@ -277,6 +337,32 @@ function App() {
     }
   }, [freezeInput]);
 
+  const isChangeRolledBack = (value) => {
+    return value === true || value === "true" || value === 1 || value === "1";
+  };
+
+  const canRollbackChangeSetRow = (row) => {
+    return (
+      row.change_set_id &&
+      row.change_reason === "manual_gantt_drag" &&
+      !isChangeRolledBack(row.is_rolled_back)
+    );
+  };
+
+  const rollbackChangeGroups = Array.from(
+    new Map(
+      changeLog
+        .filter(canRollbackChangeSetRow)
+        .map((row) => [
+          row.change_set_id,
+          {
+            change_set_id: row.change_set_id,
+          },
+        ])
+    ).values()
+  );
+  const latestRollbackChangeGroup = changeLog.find(canRollbackChangeSetRow);
+
   return (
     <div style={{ padding: "20px" }}>
       <div
@@ -296,6 +382,29 @@ function App() {
           }}
         >
           Откатить последнюю операцию
+        </button>
+
+        <button
+          onClick={() => {
+            if (!latestRollbackChangeGroup?.change_set_id) {
+              alert("Нет доступной группы изменений для отката");
+              return;
+            }
+
+            handleRollbackChangeSet(latestRollbackChangeGroup.change_set_id);
+          }}
+          disabled={!latestRollbackChangeGroup}
+          title={
+            latestRollbackChangeGroup?.change_set_id
+              ? latestRollbackChangeGroup.change_set_id
+              : "Нет доступной группы изменений для отката"
+          }
+          style={{
+            padding: "8px 12px",
+            cursor: latestRollbackChangeGroup ? "pointer" : "not-allowed",
+          }}
+        >
+          Откатить последнюю группу
         </button>
 
         <button
@@ -474,12 +583,14 @@ function App() {
             <thead>
               <tr>
                 <th style={thStyle}>ID</th>
+                <th style={thStyle}>Группа</th>
                 <th style={thStyle}>Операция</th>
                 <th style={thStyle}>Тип</th>
                 <th style={thStyle}>Станок</th>
                 <th style={thStyle}>Время</th>
                 <th style={thStyle}>Откат</th>
                 <th style={thStyle}>Создано</th>
+                <th style={thStyle}>Действие</th>
               </tr>
             </thead>
 
@@ -487,6 +598,7 @@ function App() {
               {changeLog.map((row) => {
                 const isRollback = row.change_reason === "manual_rollback";
                 const isDrag = row.change_reason === "manual_gantt_drag";
+                const canRollbackChangeSet = canRollbackChangeSetRow(row);
 
                 return (
                   <tr
@@ -500,6 +612,15 @@ function App() {
                     }}
                   >
                     <td style={tdStyle}>{row.id}</td>
+                    <td style={tdStyle}>
+                      {row.change_set_id ? (
+                        <span title={row.change_set_id}>
+                          {row.change_set_id.slice(0, 8)}
+                        </span>
+                      ) : (
+                        ""
+                      )}
+                    </td>
                     <td style={tdStyle}>{row.operation_id}</td>
                     <td style={tdStyle}>
                       {row.change_reason === "manual_gantt_drag"
@@ -522,6 +643,19 @@ function App() {
                       {row.created_at
                         ? new Date(row.created_at).toLocaleString()
                         : ""}
+                    </td>
+                    <td style={tdStyle}>
+                      {canRollbackChangeSet && (
+                        <button
+                          onClick={() => handleRollbackChangeSet(row.change_set_id)}
+                          style={{
+                            padding: "4px 8px",
+                            cursor: "pointer",
+                          }}
+                        >
+                          Откатить группу
+                        </button>
+                      )}
                     </td>
                   </tr>
                 );

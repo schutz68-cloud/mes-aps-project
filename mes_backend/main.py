@@ -1,11 +1,14 @@
 from fastapi import FastAPI, WebSocket, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional
+from uuid import uuid4
 from fastapi.middleware.cors import CORSMiddleware
 from db import SessionLocal, init_db_schema
 from models import PlanOperation, PlanChangeLog, SystemSetting
+from repair_scheduler import RepairSchedulerError, repair_plan_after_manual_move
 from websocket import connect, disconnect, broadcast_sync
 from sqlalchemy import text
+from math import ceil
 
 
 app = FastAPI(title="MES APS Backend")
@@ -171,16 +174,32 @@ def get_operations():
         rows = db.execute(
             text(
                 """
-                WITH operation_numbers AS (
+                WITH item_numbers AS (
+                    SELECT
+                        oi.id AS order_item_id,
+                        oi.order_id,
+                        row_number() OVER (
+                            PARTITION BY oi.order_id
+                            ORDER BY oi.priority, oi.id
+                        ) AS item_no
+                    FROM order_items oi
+                ),
+                operation_numbers AS (
                     SELECT
                         oo.id AS operation_id,
-                        oi.order_id,
+                        item_numbers.order_id,
+                        o.order_no,
+                        item_numbers.item_no,
+                        p.name AS product_name,
                         row_number() OVER (
                             PARTITION BY oi.id
                             ORDER BY oo.sequence_no, oo.id
                         ) AS operation_no
                     FROM order_operations oo
                     JOIN order_items oi ON oi.id = oo.order_item_id
+                    LEFT JOIN orders o ON o.id = oi.order_id
+                    JOIN products p ON p.id = oi.product_id
+                    JOIN item_numbers ON item_numbers.order_item_id = oi.id
                 )
                 SELECT
                     po.operation_id,
@@ -188,15 +207,25 @@ def get_operations():
                     po.start_time,
                     po.end_time,
                     coalesce(m.name, po.machine_id) AS machine_name,
+                    m.group_id AS machine_group_id,
                     oo.operation_type,
                     ro.operation_name,
                     onum.order_id,
-                    onum.operation_no
+                    onum.order_no,
+                    onum.item_no,
+                    onum.product_name,
+                    onum.operation_no,
+                    coalesce(mpr.setup_minutes, 0) AS setup_minutes
                 FROM plan_operations po
                 LEFT JOIN machines m ON m.id = po.machine_id
                 LEFT JOIN order_operations oo ON oo.id = po.operation_id
+                LEFT JOIN order_items oi ON oi.id = oo.order_item_id
                 LEFT JOIN routing_operations ro ON ro.id = oo.routing_operation_id
                 LEFT JOIN operation_numbers onum ON onum.operation_id = po.operation_id
+                LEFT JOIN machine_product_rates mpr
+                  ON mpr.product_id = oi.product_id
+                 AND mpr.machine_id = po.machine_id
+                 AND mpr.operation_type = oo.operation_type
                 ORDER BY po.start_time, po.operation_id
                 """
             )
@@ -206,14 +235,23 @@ def get_operations():
             {
                 "id": row["operation_id"],
                 "label": (
-                    f"{int(row['order_id']):03d}.{int(row['operation_no']):02d}"
-                    if row["order_id"] is not None and row["operation_no"] is not None
+                    (
+                        f"{row['order_no']} {row['product_name']}"
+                        if row["order_no"]
+                        else f"{int(row['order_id']):03d} {row['product_name']}"
+                    )
+                    if row["order_id"] is not None
+                    and row["product_name"] is not None
                     else str(row["operation_id"])
                 ),
+                "order_id": row["order_id"],
                 "machine": row["machine_id"],
                 "machine_name": row["machine_name"],
+                "machine_group_id": row["machine_group_id"],
                 "operation_type": row["operation_type"],
                 "operation_name": row["operation_name"],
+                "product_name": row["product_name"],
+                "setup_minutes": int(row["setup_minutes"] or 0),
                 "start": int(row["start_time"]) if row["start_time"] is not None else 0,
                 "end": int(row["end_time"]) if row["end_time"] is not None else 0,
             }
@@ -231,13 +269,12 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
     db = SessionLocal()
     try:
         start = int(payload.start)
-        end = int(payload.end)
         machine_raw = payload.machine
 
-        if start >= end:
+        if start < 0:
             raise HTTPException(
                 status_code=400,
-                detail="Ошибка валидации: время начала должно быть меньше времени окончания",
+                detail="Ошибка валидации: время начала не может быть отрицательным",
             )
 
         if machine_raw is None:
@@ -290,12 +327,12 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
         else:
             machine_value = str(machine_clean)
 
-        machine_exists = db.execute(
-            text("SELECT 1 FROM machines WHERE id = :machine_id"),
+        machine = db.execute(
+            text("SELECT id, group_id FROM machines WHERE id = :machine_id"),
             {"machine_id": machine_value},
-        ).first()
+        ).mappings().first()
 
-        if not machine_exists:
+        if not machine:
             raise HTTPException(
                 status_code=404,
                 detail=f"Станок {machine_value} не найден",
@@ -310,6 +347,7 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
                     oi.id AS existing_order_item_id,
                     oo.sequence_no,
                     oo.operation_type,
+                    oo.quantity,
                     oo.routing_operation_id,
                     ro.id AS existing_routing_operation_id,
                     oi.product_id
@@ -358,141 +396,109 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
                 detail=f"Для операции заказа {op_id} не задан тип операции",
             )
 
-        if operation_context:
-            rate_exists = db.execute(
-                text(
-                    """
-                    SELECT 1
-                    FROM machine_product_rates
-                    WHERE product_id = :product_id
-                      AND machine_id = :machine_id
-                      AND operation_type = :operation_type
-                    """
-                ),
-                {
-                    "product_id": operation_context["product_id"],
-                    "machine_id": machine_value,
-                    "operation_type": operation_context["operation_type"],
-                },
-            ).first()
+        allowed_group = db.execute(
+            text(
+                """
+                SELECT 1
+                FROM routing_operation_machine_groups
+                WHERE routing_operation_id = :routing_operation_id
+                  AND machine_group_id = :machine_group_id
+                """
+            ),
+            {
+                "routing_operation_id": operation_context["routing_operation_id"],
+                "machine_group_id": machine["group_id"],
+            },
+        ).first()
 
-            if not rate_exists:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Операция недопустима на выбранном станке: "
-                        "нет нормы для изделия, станка и типа операции"
-                    ),
-                )
-
-            previous_operation = db.execute(
-                text(
-                    """
-                    SELECT po.operation_id, po.end_time
-                    FROM order_operations oo
-                    JOIN plan_operations po ON po.operation_id = oo.id
-                    WHERE oo.order_item_id = :order_item_id
-                      AND oo.sequence_no < :sequence_no
-                    ORDER BY oo.sequence_no DESC, oo.id DESC
-                    LIMIT 1
-                    """
-                ),
-                {
-                    "order_item_id": operation_context["order_item_id"],
-                    "sequence_no": operation_context["sequence_no"],
-                },
-            ).mappings().first()
-
-            if previous_operation:
-                min_start = int(previous_operation["end_time"]) + INTER_OPERATION_GAP_MINUTES
-            else:
-                min_start = None
-
-            if min_start is not None and start < min_start:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Нарушена последовательность переделов: операция должна "
-                        f"начинаться не раньше чем через {INTER_OPERATION_GAP_MINUTES} мин. "
-                        f"после окончания операции {previous_operation['operation_id']}"
-                    ),
-                )
-
-            next_operation = db.execute(
-                text(
-                    """
-                    SELECT po.operation_id, po.start_time
-                    FROM order_operations oo
-                    JOIN plan_operations po ON po.operation_id = oo.id
-                    WHERE oo.order_item_id = :order_item_id
-                      AND oo.sequence_no > :sequence_no
-                    ORDER BY oo.sequence_no ASC, oo.id ASC
-                    LIMIT 1
-                    """
-                ),
-                {
-                    "order_item_id": operation_context["order_item_id"],
-                    "sequence_no": operation_context["sequence_no"],
-                },
-            ).mappings().first()
-
-            if next_operation:
-                max_end = int(next_operation["start_time"]) - INTER_OPERATION_GAP_MINUTES
-            else:
-                max_end = None
-
-            if max_end is not None and end > max_end:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Нарушена последовательность переделов: операция должна "
-                        f"заканчиваться минимум за {INTER_OPERATION_GAP_MINUTES} мин. "
-                        f"до начала операции {next_operation['operation_id']}"
-                    ),
-                )
-
-        overlapping_op = (
-            db.query(PlanOperation)
-            .filter(PlanOperation.operation_id != op_id)
-            .filter(PlanOperation.machine_id == machine_value)
-            .filter(PlanOperation.start_time < end)
-            .filter(PlanOperation.end_time > start)
-            .first()
-        )
-
-        if overlapping_op:
+        if not allowed_group:
             raise HTTPException(
                 status_code=409,
-                detail={
-                    "message": "Операция пересекается с другой операцией на этом же станке",
-                    "machine": machine_value,
-                    "current_operation_id": op_id,
-                    "overlapping_operation_id": overlapping_op.operation_id,
-                    "requested_start": start,
-                    "requested_end": end,
-                    "overlapping_start": (
-                        int(overlapping_op.start_time)
-                        if overlapping_op.start_time is not None
-                        else 0
-                    ),
-                    "overlapping_end": (
-                        int(overlapping_op.end_time)
-                        if overlapping_op.end_time is not None
-                        else 0
-                    ),
-                },
+                detail="Операция не может выполняться на выбранной группе оборудования",
+            )
+
+        rate = db.execute(
+            text(
+                """
+                SELECT
+                    units_per_minute,
+                    coalesce(setup_minutes, 0) AS setup_minutes
+                FROM machine_product_rates
+                WHERE product_id = :product_id
+                  AND machine_id = :machine_id
+                  AND operation_type = :operation_type
+                """
+            ),
+            {
+                "product_id": operation_context["product_id"],
+                "machine_id": machine_value,
+                "operation_type": operation_context["operation_type"],
+            },
+        ).mappings().first()
+
+        if not rate:
+            raise HTTPException(
+                status_code=409,
+                detail="Для изделия нет нормы на выбранном станке",
+            )
+
+        units_per_minute = float(rate["units_per_minute"] or 0)
+        if units_per_minute <= 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Для изделия задана некорректная норма на выбранном станке",
+            )
+
+        setup_minutes = int(rate["setup_minutes"] or 0)
+        quantity = int(operation_context["quantity"])
+        duration_minutes = ceil(quantity / units_per_minute) + setup_minutes
+        calculated_end = start + duration_minutes
+
+        previous_operation = db.execute(
+            text(
+                """
+                SELECT po.operation_id, po.end_time
+                FROM order_operations oo
+                JOIN plan_operations po ON po.operation_id = oo.id
+                WHERE oo.order_item_id = :order_item_id
+                  AND oo.sequence_no < :sequence_no
+                ORDER BY oo.sequence_no DESC, oo.id DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "order_item_id": operation_context["order_item_id"],
+                "sequence_no": operation_context["sequence_no"],
+            },
+        ).mappings().first()
+
+        if previous_operation:
+            min_start = int(previous_operation["end_time"]) + INTER_OPERATION_GAP_MINUTES
+        else:
+            min_start = None
+
+        if min_start is not None and start < min_start:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Нарушена последовательность переделов: операция должна "
+                    f"начинаться не раньше чем через {INTER_OPERATION_GAP_MINUTES} мин. "
+                    f"после окончания операции {previous_operation['operation_id']}"
+                ),
             )
 
         old_plan_version_id = op.plan_version_id
         old_machine_id = op.machine_id
         old_start_time = int(op.start_time) if op.start_time is not None else 0
         old_end_time = int(op.end_time) if op.end_time is not None else 0
+        change_set_id = str(uuid4())
 
         op.start_time = start
-        op.end_time = end
+        op.end_time = calculated_end
         op.machine_id = machine_value
 
         change = PlanChangeLog(
+            change_set_id=change_set_id,
             plan_version_id=old_plan_version_id,
             operation_id=op.operation_id,
             old_machine_id=old_machine_id,
@@ -500,39 +506,80 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
             old_start_time=old_start_time,
             old_end_time=old_end_time,
             new_start_time=start,
-            new_end_time=end,
+            new_end_time=calculated_end,
             change_reason="manual_gantt_drag",
         )
 
         db.add(change)
+        db.flush()
+
+        try:
+            changed_operations = repair_plan_after_manual_move(
+                db=db,
+                changed_operation_id=op.operation_id,
+                freeze_horizon_minutes=freeze_horizon_minutes,
+                change_set_id=change_set_id,
+            )
+        except RepairSchedulerError as error:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=f"Невозможно перепланировать план после ручного изменения: {error}",
+            )
+
         db.commit()
         db.refresh(op)
 
         operation_meta = db.execute(
             text(
                 """
-                WITH operation_numbers AS (
+                WITH item_numbers AS (
+                    SELECT
+                        oi.id AS order_item_id,
+                        oi.order_id,
+                        row_number() OVER (
+                            PARTITION BY oi.order_id
+                            ORDER BY oi.priority, oi.id
+                        ) AS item_no
+                    FROM order_items oi
+                ),
+                operation_numbers AS (
                     SELECT
                         oo.id AS operation_id,
-                        oi.order_id,
+                        item_numbers.order_id,
+                        o.order_no,
+                        item_numbers.item_no,
+                        p.name AS product_name,
                         row_number() OVER (
                             PARTITION BY oi.id
                             ORDER BY oo.sequence_no, oo.id
-                        ) AS operation_no
+                    ) AS operation_no
                     FROM order_operations oo
                     JOIN order_items oi ON oi.id = oo.order_item_id
+                    LEFT JOIN orders o ON o.id = oi.order_id
+                    JOIN products p ON p.id = oi.product_id
+                    JOIN item_numbers ON item_numbers.order_item_id = oi.id
                 )
                 SELECT
                     coalesce(m.name, :machine_id) AS machine_name,
+                    m.group_id AS machine_group_id,
                     oo.operation_type,
                     ro.operation_name,
                     onum.order_id,
-                    onum.operation_no
+                    onum.order_no,
+                    onum.item_no,
+                    onum.product_name,
+                    onum.operation_no,
+                    coalesce(mpr.setup_minutes, 0) AS setup_minutes
                 FROM order_operations oo
                 JOIN order_items oi ON oi.id = oo.order_item_id
                 LEFT JOIN routing_operations ro ON ro.id = oo.routing_operation_id
                 LEFT JOIN machines m ON m.id = :machine_id
                 LEFT JOIN operation_numbers onum ON onum.operation_id = oo.id
+                LEFT JOIN machine_product_rates mpr
+                  ON mpr.product_id = oi.product_id
+                 AND mpr.machine_id = :machine_id
+                 AND mpr.operation_type = oo.operation_type
                 WHERE oo.id = :operation_id
                 """
             ),
@@ -547,15 +594,25 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
             "data": {
                 "id": op.operation_id,
                 "label": (
-                    f"{int(operation_meta['order_id']):03d}.{int(operation_meta['operation_no']):02d}"
+                    (
+                        f"{operation_meta['order_no']} {operation_meta['product_name']}"
+                        if operation_meta["order_no"]
+                        else f"{int(operation_meta['order_id']):03d} {operation_meta['product_name']}"
+                    )
                     if operation_meta
                     and operation_meta["order_id"] is not None
-                    and operation_meta["operation_no"] is not None
+                    and operation_meta["product_name"] is not None
                     else str(op.operation_id)
+                ),
+                "order_id": (
+                    operation_meta["order_id"] if operation_meta else None
                 ),
                 "machine": op.machine_id,
                 "machine_name": (
                     operation_meta["machine_name"] if operation_meta else op.machine_id
+                ),
+                "machine_group_id": (
+                    operation_meta["machine_group_id"] if operation_meta else None
                 ),
                 "operation_type": (
                     operation_meta["operation_type"] if operation_meta else None
@@ -563,14 +620,39 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
                 "operation_name": (
                     operation_meta["operation_name"] if operation_meta else None
                 ),
+                "product_name": (
+                    operation_meta["product_name"] if operation_meta else None
+                ),
+                "setup_minutes": (
+                    int(operation_meta["setup_minutes"] or 0)
+                    if operation_meta
+                    else 0
+                ),
                 "start": int(op.start_time) if op.start_time is not None else 0,
                 "end": int(op.end_time) if op.end_time is not None else 0,
             },
         }
 
+        operation_data = event["data"]
+        bulk_operations = [operation_data]
+        for changed_operation in changed_operations:
+            if changed_operation["id"] != op.operation_id:
+                bulk_operations.append(changed_operation)
+
+        event = {
+            "type": "plan_operations_updated",
+            "data": bulk_operations,
+        }
+
         broadcast_sync(event)
 
-        return {"status": "ok"}
+        return {
+            "status": "ok",
+            "operation": operation_data,
+            "changed_operations": bulk_operations,
+            "duration_minutes": duration_minutes,
+            "change_set_id": change_set_id,
+        }
 
     finally:
         db.close()
@@ -656,28 +738,53 @@ async def rollback_last_change():
         operation_meta = db.execute(
             text(
                 """
-                WITH operation_numbers AS (
+                WITH item_numbers AS (
+                    SELECT
+                        oi.id AS order_item_id,
+                        oi.order_id,
+                        row_number() OVER (
+                            PARTITION BY oi.order_id
+                            ORDER BY oi.priority, oi.id
+                        ) AS item_no
+                    FROM order_items oi
+                ),
+                operation_numbers AS (
                     SELECT
                         oo.id AS operation_id,
-                        oi.order_id,
+                        item_numbers.order_id,
+                        o.order_no,
+                        item_numbers.item_no,
+                        p.name AS product_name,
                         row_number() OVER (
                             PARTITION BY oi.id
                             ORDER BY oo.sequence_no, oo.id
-                        ) AS operation_no
+                    ) AS operation_no
                     FROM order_operations oo
                     JOIN order_items oi ON oi.id = oo.order_item_id
+                    LEFT JOIN orders o ON o.id = oi.order_id
+                    JOIN products p ON p.id = oi.product_id
+                    JOIN item_numbers ON item_numbers.order_item_id = oi.id
                 )
                 SELECT
                     coalesce(m.name, :machine_id) AS machine_name,
+                    m.group_id AS machine_group_id,
                     oo.operation_type,
                     ro.operation_name,
                     onum.order_id,
-                    onum.operation_no
+                    onum.order_no,
+                    onum.item_no,
+                    onum.product_name,
+                    onum.operation_no,
+                    coalesce(mpr.setup_minutes, 0) AS setup_minutes
                 FROM order_operations oo
                 JOIN order_items oi ON oi.id = oo.order_item_id
                 LEFT JOIN routing_operations ro ON ro.id = oo.routing_operation_id
                 LEFT JOIN machines m ON m.id = :machine_id
                 LEFT JOIN operation_numbers onum ON onum.operation_id = oo.id
+                LEFT JOIN machine_product_rates mpr
+                  ON mpr.product_id = oi.product_id
+                 AND mpr.machine_id = :machine_id
+                 AND mpr.operation_type = oo.operation_type
                 WHERE oo.id = :operation_id
                 """
             ),
@@ -692,21 +799,39 @@ async def rollback_last_change():
             "data": {
                 "id": op.operation_id,
                 "label": (
-                    f"{int(operation_meta['order_id']):03d}.{int(operation_meta['operation_no']):02d}"
+                    (
+                        f"{operation_meta['order_no']} {operation_meta['product_name']}"
+                        if operation_meta["order_no"]
+                        else f"{int(operation_meta['order_id']):03d} {operation_meta['product_name']}"
+                    )
                     if operation_meta
                     and operation_meta["order_id"] is not None
-                    and operation_meta["operation_no"] is not None
+                    and operation_meta["product_name"] is not None
                     else str(op.operation_id)
+                ),
+                "order_id": (
+                    operation_meta["order_id"] if operation_meta else None
                 ),
                 "machine": op.machine_id,
                 "machine_name": (
                     operation_meta["machine_name"] if operation_meta else op.machine_id
+                ),
+                "machine_group_id": (
+                    operation_meta["machine_group_id"] if operation_meta else None
                 ),
                 "operation_type": (
                     operation_meta["operation_type"] if operation_meta else None
                 ),
                 "operation_name": (
                     operation_meta["operation_name"] if operation_meta else None
+                ),
+                "product_name": (
+                    operation_meta["product_name"] if operation_meta else None
+                ),
+                "setup_minutes": (
+                    int(operation_meta["setup_minutes"] or 0)
+                    if operation_meta
+                    else 0
                 ),
                 "start": int(op.start_time) if op.start_time is not None else 0,
                 "end": int(op.end_time) if op.end_time is not None else 0,
@@ -729,6 +854,117 @@ async def rollback_last_change():
 # ======================
 # GET PLAN CHANGE LOG
 # ======================
+@app.post("/plan_change_log/change_set/{change_set_id}/rollback")
+async def rollback_change_set(change_set_id: str):
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(PlanChangeLog)
+            .filter(PlanChangeLog.change_set_id == change_set_id)
+            .order_by(PlanChangeLog.id.desc())
+            .all()
+        )
+
+        if not rows:
+            raise HTTPException(status_code=404, detail="Группа изменений не найдена")
+
+        rollback_reasons = {"manual_gantt_drag", "repair_scheduler_shift"}
+        rollback_rows = [
+            row
+            for row in rows
+            if row.change_reason in rollback_reasons and not row.is_rolled_back
+        ]
+
+        if not rollback_rows:
+            raise HTTPException(
+                status_code=409,
+                detail="Группа изменений уже была откатана",
+            )
+
+        rollback_change_set_id = str(uuid4())
+        updated_by_operation_id = {}
+
+        for row in rollback_rows:
+            op = (
+                db.query(PlanOperation)
+                .filter(PlanOperation.operation_id == row.operation_id)
+                .first()
+            )
+
+            if not op:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Плановая операция не найдена",
+                )
+
+            current_machine_id = op.machine_id
+            current_start_time = int(op.start_time) if op.start_time is not None else 0
+            current_end_time = int(op.end_time) if op.end_time is not None else 0
+
+            op.machine_id = row.old_machine_id
+            op.start_time = int(row.old_start_time)
+            op.end_time = int(row.old_end_time)
+
+            row.is_rolled_back = True
+            row.rollback_reason = "manual_change_set_rollback"
+
+            db.execute(
+                text("UPDATE plan_change_log SET rollback_at = now() WHERE id = :id"),
+                {"id": row.id},
+            )
+
+            rollback_log = PlanChangeLog(
+                change_set_id=rollback_change_set_id,
+                plan_version_id=row.plan_version_id,
+                operation_id=row.operation_id,
+                old_machine_id=current_machine_id,
+                new_machine_id=row.old_machine_id,
+                old_start_time=current_start_time,
+                old_end_time=current_end_time,
+                new_start_time=int(row.old_start_time),
+                new_end_time=int(row.old_end_time),
+                change_reason="manual_rollback",
+                is_rolled_back=True,
+                rollback_reason="change_set_rollback_event",
+            )
+            db.add(rollback_log)
+
+            updated_by_operation_id[op.operation_id] = {
+                "id": op.operation_id,
+                "machine": op.machine_id,
+                "start": int(op.start_time),
+                "end": int(op.end_time),
+            }
+
+        db.commit()
+
+        updated_operations = list(updated_by_operation_id.values())
+        event = {
+            "type": "plan_operations_updated",
+            "data": updated_operations,
+        }
+        broadcast_sync(event)
+
+        return {
+            "status": "ok",
+            "rolled_back_change_set_id": change_set_id,
+            "rollback_change_set_id": rollback_change_set_id,
+            "updated_operations": updated_operations,
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось откатить группу изменений: {error}",
+        )
+    finally:
+        db.close()
+
+
 @app.get("/plan_change_log")
 def get_plan_change_log(
     limit: int = 20,
@@ -762,6 +998,7 @@ def get_plan_change_log(
         return [
             {
                 "id": row.id,
+                "change_set_id": row.change_set_id,
                 "plan_version_id": row.plan_version_id,
                 "operation_id": row.operation_id,
                 "old_machine_id": row.old_machine_id,

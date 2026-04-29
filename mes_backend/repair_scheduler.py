@@ -1,0 +1,243 @@
+from math import ceil
+
+from sqlalchemy import text
+
+from models import PlanChangeLog
+
+
+INTER_OPERATION_GAP_MINUTES = 15
+MAX_ITERATIONS = 1000
+
+
+class RepairSchedulerError(Exception):
+    pass
+
+
+def _calculate_duration(operation):
+    units_per_minute = float(operation["units_per_minute"] or 0)
+    if units_per_minute <= 0:
+        raise RepairSchedulerError("для операции задана некорректная норма производительности")
+
+    return ceil(int(operation["quantity"]) / units_per_minute) + int(
+        operation["setup_minutes"] or 0
+    )
+
+
+def _load_operations(db):
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                po.plan_version_id,
+                po.operation_id,
+                po.machine_id,
+                coalesce(po.start_time, 0) AS start_time,
+                coalesce(po.end_time, 0) AS end_time,
+                coalesce(po.is_locked, false) AS is_locked,
+                po.lock_reason,
+                oo.order_item_id,
+                oo.sequence_no,
+                oo.quantity,
+                oo.operation_type,
+                oi.product_id,
+                coalesce(mpr.setup_minutes, 0) AS setup_minutes,
+                mpr.units_per_minute
+            FROM plan_operations po
+            JOIN order_operations oo ON oo.id = po.operation_id
+            JOIN order_items oi ON oi.id = oo.order_item_id
+            LEFT JOIN machine_product_rates mpr
+              ON mpr.product_id = oi.product_id
+             AND mpr.machine_id = po.machine_id
+             AND mpr.operation_type = oo.operation_type
+            ORDER BY po.start_time, po.operation_id
+            """
+        )
+    ).mappings().all()
+
+    operations = []
+    for row in rows:
+        if row["units_per_minute"] is None:
+            raise RepairSchedulerError(
+                f"для операции {row['operation_id']} нет нормы на выбранном станке"
+            )
+
+        operation = dict(row)
+        operation["start_time"] = int(operation["start_time"])
+        operation["end_time"] = int(operation["end_time"])
+        operation["duration_minutes"] = _calculate_duration(operation)
+        operations.append(operation)
+
+    return operations
+
+
+def _assert_can_shift(operation, freeze_horizon_minutes):
+    if operation["start_time"] < freeze_horizon_minutes:
+        raise RepairSchedulerError(
+            "Невозможно перепланировать: операция находится в замороженной зоне плана"
+        )
+
+    if operation["is_locked"]:
+        raise RepairSchedulerError(
+            "Невозможно перепланировать: операция зафиксирована вручную"
+        )
+
+
+def _shift_operation(db, operation, new_start, changed_operations, change_set_id):
+    if new_start <= operation["start_time"]:
+        return False
+
+    old_machine_id = operation["machine_id"]
+    old_start_time = operation["start_time"]
+    old_end_time = operation["end_time"]
+    new_end = new_start + operation["duration_minutes"]
+
+    db.execute(
+        text(
+            """
+            UPDATE plan_operations
+            SET start_time = :start_time,
+                end_time = :end_time
+            WHERE operation_id = :operation_id
+            """
+        ),
+        {
+            "operation_id": operation["operation_id"],
+            "start_time": new_start,
+            "end_time": new_end,
+        },
+    )
+
+    db.add(
+        PlanChangeLog(
+            change_set_id=change_set_id,
+            plan_version_id=operation["plan_version_id"],
+            operation_id=operation["operation_id"],
+            old_machine_id=old_machine_id,
+            new_machine_id=old_machine_id,
+            old_start_time=old_start_time,
+            old_end_time=old_end_time,
+            new_start_time=new_start,
+            new_end_time=new_end,
+            change_reason="repair_scheduler_shift",
+        )
+    )
+
+    operation["start_time"] = new_start
+    operation["end_time"] = new_end
+    changed_operations[operation["operation_id"]] = {
+        "id": operation["operation_id"],
+        "machine": operation["machine_id"],
+        "start": operation["start_time"],
+        "end": operation["end_time"],
+    }
+    return True
+
+
+def _validate_plan(operations):
+    by_machine = {}
+    by_order_item = {}
+
+    for operation in operations:
+        by_machine.setdefault(operation["machine_id"], []).append(operation)
+        by_order_item.setdefault(operation["order_item_id"], []).append(operation)
+
+    for machine_operations in by_machine.values():
+        ordered = sorted(
+            machine_operations,
+            key=lambda op: (op["start_time"], op["end_time"], op["operation_id"]),
+        )
+        previous = None
+        for operation in ordered:
+            if previous and operation["start_time"] < previous["end_time"]:
+                raise RepairSchedulerError(
+                    "Невозможно восстановить допустимый план после изменения"
+                )
+            previous = operation
+
+    for item_operations in by_order_item.values():
+        ordered = sorted(
+            item_operations,
+            key=lambda op: (op["sequence_no"], op["operation_id"]),
+        )
+        previous = None
+        for operation in ordered:
+            if (
+                previous
+                and operation["start_time"]
+                < previous["end_time"] + INTER_OPERATION_GAP_MINUTES
+            ):
+                raise RepairSchedulerError(
+                    "Невозможно восстановить допустимый план после изменения"
+                )
+            previous = operation
+
+
+def repair_plan_after_manual_move(
+    db, changed_operation_id: int, freeze_horizon_minutes: int, change_set_id: str
+) -> list[dict]:
+    operations = _load_operations(db)
+    changed_operations = {}
+
+    if not any(op["operation_id"] == changed_operation_id for op in operations):
+        raise RepairSchedulerError("изменённая операция не найдена в плане")
+
+    for _ in range(MAX_ITERATIONS):
+        moved = False
+
+        by_order_item = {}
+        for operation in operations:
+            by_order_item.setdefault(operation["order_item_id"], []).append(operation)
+
+        for item_operations in by_order_item.values():
+            ordered = sorted(
+                item_operations,
+                key=lambda op: (op["sequence_no"], op["operation_id"]),
+            )
+            previous = None
+            for operation in ordered:
+                if previous:
+                    required_start = previous["end_time"] + INTER_OPERATION_GAP_MINUTES
+                    if required_start > operation["start_time"]:
+                        _assert_can_shift(operation, freeze_horizon_minutes)
+                        moved = (
+                            _shift_operation(
+                                db,
+                                operation,
+                                required_start,
+                                changed_operations,
+                                change_set_id,
+                            )
+                            or moved
+                        )
+                previous = operation
+
+        by_machine = {}
+        for operation in operations:
+            by_machine.setdefault(operation["machine_id"], []).append(operation)
+
+        for machine_operations in by_machine.values():
+            ordered = sorted(
+                machine_operations,
+                key=lambda op: (op["start_time"], op["end_time"], op["operation_id"]),
+            )
+            previous = None
+            for operation in ordered:
+                if previous and previous["end_time"] > operation["start_time"]:
+                    _assert_can_shift(operation, freeze_horizon_minutes)
+                    moved = (
+                        _shift_operation(
+                            db,
+                            operation,
+                            previous["end_time"],
+                            changed_operations,
+                            change_set_id,
+                        )
+                        or moved
+                    )
+                previous = operation
+
+        if not moved:
+            _validate_plan(operations)
+            return list(changed_operations.values())
+
+    raise RepairSchedulerError("превышен лимит итераций перепланирования")
