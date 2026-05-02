@@ -23,7 +23,7 @@ def _calculate_duration(operation):
     )
 
 
-def _load_operations(db):
+def _load_operations(db, active_plan_version_id):
     rows = db.execute(
         text(
             """
@@ -49,9 +49,11 @@ def _load_operations(db):
               ON mpr.product_id = oi.product_id
              AND mpr.machine_id = po.machine_id
              AND mpr.operation_type = oo.operation_type
+            WHERE po.plan_version_id = :plan_version_id
             ORDER BY po.start_time, po.operation_id
             """
-        )
+        ),
+        {"plan_version_id": active_plan_version_id},
     ).mappings().all()
 
     operations = []
@@ -82,7 +84,9 @@ def _assert_can_shift(operation, freeze_horizon_minutes):
         )
 
 
-def _shift_operation(db, operation, new_start, changed_operations, change_set_id):
+def _shift_operation(
+    db, operation, new_start, changed_operations, change_set_id, active_plan_version_id
+):
     if new_start <= operation["start_time"]:
         return False
 
@@ -98,10 +102,12 @@ def _shift_operation(db, operation, new_start, changed_operations, change_set_id
             SET start_time = :start_time,
                 end_time = :end_time
             WHERE operation_id = :operation_id
+              AND plan_version_id = :plan_version_id
             """
         ),
         {
             "operation_id": operation["operation_id"],
+            "plan_version_id": active_plan_version_id,
             "start_time": new_start,
             "end_time": new_end,
         },
@@ -110,7 +116,7 @@ def _shift_operation(db, operation, new_start, changed_operations, change_set_id
     db.add(
         PlanChangeLog(
             change_set_id=change_set_id,
-            plan_version_id=operation["plan_version_id"],
+            plan_version_id=active_plan_version_id,
             operation_id=operation["operation_id"],
             old_machine_id=old_machine_id,
             new_machine_id=old_machine_id,
@@ -126,6 +132,7 @@ def _shift_operation(db, operation, new_start, changed_operations, change_set_id
     operation["end_time"] = new_end
     changed_operations[operation["operation_id"]] = {
         "id": operation["operation_id"],
+        "plan_version_id": active_plan_version_id,
         "machine": operation["machine_id"],
         "start": operation["start_time"],
         "end": operation["end_time"],
@@ -173,9 +180,13 @@ def _validate_plan(operations):
 
 
 def repair_plan_after_manual_move(
-    db, changed_operation_id: int, freeze_horizon_minutes: int, change_set_id: str
+    db,
+    changed_operation_id: int,
+    freeze_horizon_minutes: int,
+    change_set_id: str,
+    active_plan_version_id: int,
 ) -> list[dict]:
-    operations = _load_operations(db)
+    operations = _load_operations(db, active_plan_version_id)
     changed_operations = {}
 
     if not any(op["operation_id"] == changed_operation_id for op in operations):
@@ -206,6 +217,7 @@ def repair_plan_after_manual_move(
                                 required_start,
                                 changed_operations,
                                 change_set_id,
+                                active_plan_version_id,
                             )
                             or moved
                         )
@@ -231,6 +243,7 @@ def repair_plan_after_manual_move(
                             previous["end_time"],
                             changed_operations,
                             change_set_id,
+                            active_plan_version_id,
                         )
                         or moved
                     )

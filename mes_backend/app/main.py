@@ -4,7 +4,7 @@ from typing import Optional
 from uuid import uuid4
 from fastapi.middleware.cors import CORSMiddleware
 from app.db import SessionLocal, init_db_schema
-from app.models import PlanOperation, PlanChangeLog, SystemSetting
+from app.models import PlanOperation, PlanChangeLog, PlanVersion, SystemSetting
 from app.repair_scheduler import RepairSchedulerError, repair_plan_after_manual_move
 from app.websocket import connect, disconnect, broadcast_sync
 from sqlalchemy import text
@@ -65,6 +65,67 @@ def get_freeze_horizon_minutes(db) -> int:
         return DEFAULT_FREEZE_HORIZON_MINUTES
 
 
+def get_active_plan_version_id(db) -> int:
+    active_versions = (
+        db.query(PlanVersion)
+        .filter(PlanVersion.status == "active")
+        .order_by(PlanVersion.id.desc())
+        .all()
+    )
+
+    if active_versions:
+        if len(active_versions) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Найдено несколько активных версий плана. Оставьте только одну активную версию",
+            )
+        return int(active_versions[0].id)
+
+    try:
+        active_version = PlanVersion(
+            id=1,
+            name="Основной план",
+            status="active",
+            created_by="system",
+            description="Текущая активная версия плана",
+        )
+        db.add(active_version)
+        db.execute(
+            text(
+                """
+                UPDATE plan_operations
+                SET plan_version_id = 1
+                WHERE plan_version_id IS NULL
+                """
+            )
+        )
+        db.commit()
+        return 1
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось создать активную версию плана: {error}",
+        )
+
+
+def serialize_plan_version(plan_version):
+    return {
+        "id": plan_version.id,
+        "name": plan_version.name,
+        "status": plan_version.status,
+        "created_at": (
+            plan_version.created_at.isoformat() if plan_version.created_at else None
+        ),
+        "created_by": plan_version.created_by,
+        "approved_at": (
+            plan_version.approved_at.isoformat() if plan_version.approved_at else None
+        ),
+        "approved_by": plan_version.approved_by,
+        "description": plan_version.description,
+    }
+
+
 # ======================
 # CORS
 # ======================
@@ -83,6 +144,40 @@ app.add_middleware(
 @app.get("/")
 def root():
     return {"status": "backend works"}
+
+
+# ======================
+# PLAN VERSIONS
+# ======================
+@app.get("/plan_versions")
+def get_plan_versions():
+    db = SessionLocal()
+    try:
+        get_active_plan_version_id(db)
+        rows = db.query(PlanVersion).order_by(PlanVersion.id).all()
+        return [serialize_plan_version(row) for row in rows]
+    finally:
+        db.close()
+
+
+@app.get("/plan_versions/active")
+def get_active_plan_version():
+    db = SessionLocal()
+    try:
+        active_plan_version_id = get_active_plan_version_id(db)
+        active_version = (
+            db.query(PlanVersion)
+            .filter(PlanVersion.id == active_plan_version_id)
+            .first()
+        )
+        if not active_version:
+            raise HTTPException(
+                status_code=404,
+                detail="Активная версия плана не найдена",
+            )
+        return serialize_plan_version(active_version)
+    finally:
+        db.close()
 
 
 # ======================
@@ -171,6 +266,7 @@ async def update_freeze_horizon(
 def get_operations():
     db = SessionLocal()
     try:
+        active_plan_version_id = get_active_plan_version_id(db)
         rows = db.execute(
             text(
                 """
@@ -202,6 +298,7 @@ def get_operations():
                     JOIN item_numbers ON item_numbers.order_item_id = oi.id
                 )
                 SELECT
+                    po.plan_version_id,
                     po.operation_id,
                     po.machine_id,
                     po.start_time,
@@ -226,14 +323,17 @@ def get_operations():
                   ON mpr.product_id = oi.product_id
                  AND mpr.machine_id = po.machine_id
                  AND mpr.operation_type = oo.operation_type
+                WHERE po.plan_version_id = :plan_version_id
                 ORDER BY po.start_time, po.operation_id
                 """
-            )
+            ),
+            {"plan_version_id": active_plan_version_id},
         ).mappings().all()
 
         return [
             {
                 "id": row["operation_id"],
+                "plan_version_id": row["plan_version_id"],
                 "label": (
                     (
                         f"{row['order_no']} {row['product_name']}"
@@ -268,6 +368,7 @@ def get_operations():
 async def update_operation(op_id: int, payload: OperationUpdatePayload):
     db = SessionLocal()
     try:
+        active_plan_version_id = get_active_plan_version_id(db)
         start = int(payload.start)
         machine_raw = payload.machine
 
@@ -293,7 +394,12 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
         else:
             machine_clean = machine_raw
 
-        op = db.query(PlanOperation).filter(PlanOperation.operation_id == op_id).first()
+        op = (
+            db.query(PlanOperation)
+            .filter(PlanOperation.operation_id == op_id)
+            .filter(PlanOperation.plan_version_id == active_plan_version_id)
+            .first()
+        )
 
         if not op:
             raise HTTPException(
@@ -462,6 +568,7 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
                 JOIN plan_operations po ON po.operation_id = oo.id
                 WHERE oo.order_item_id = :order_item_id
                   AND oo.sequence_no < :sequence_no
+                  AND po.plan_version_id = :plan_version_id
                 ORDER BY oo.sequence_no DESC, oo.id DESC
                 LIMIT 1
                 """
@@ -469,6 +576,7 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
             {
                 "order_item_id": operation_context["order_item_id"],
                 "sequence_no": operation_context["sequence_no"],
+                "plan_version_id": active_plan_version_id,
             },
         ).mappings().first()
 
@@ -487,7 +595,6 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
                 ),
             )
 
-        old_plan_version_id = op.plan_version_id
         old_machine_id = op.machine_id
         old_start_time = int(op.start_time) if op.start_time is not None else 0
         old_end_time = int(op.end_time) if op.end_time is not None else 0
@@ -499,7 +606,7 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
 
         change = PlanChangeLog(
             change_set_id=change_set_id,
-            plan_version_id=old_plan_version_id,
+            plan_version_id=active_plan_version_id,
             operation_id=op.operation_id,
             old_machine_id=old_machine_id,
             new_machine_id=machine_value,
@@ -519,6 +626,7 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
                 changed_operation_id=op.operation_id,
                 freeze_horizon_minutes=freeze_horizon_minutes,
                 change_set_id=change_set_id,
+                active_plan_version_id=active_plan_version_id,
             )
         except RepairSchedulerError as error:
             db.rollback()
@@ -593,6 +701,7 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
             "type": "operation_update",
             "data": {
                 "id": op.operation_id,
+                "plan_version_id": active_plan_version_id,
                 "label": (
                     (
                         f"{operation_meta['order_no']} {operation_meta['product_name']}"
@@ -667,6 +776,7 @@ async def rollback_last_change():
 
     db = SessionLocal()
     try:
+        active_plan_version_id = get_active_plan_version_id(db)
         last_change = (
             db.query(PlanChangeLog)
             .filter(
@@ -674,6 +784,7 @@ async def rollback_last_change():
                 | (PlanChangeLog.is_rolled_back.is_(None))
             )
             .filter(PlanChangeLog.change_reason == "manual_gantt_drag")
+            .filter(PlanChangeLog.plan_version_id == active_plan_version_id)
             .order_by(PlanChangeLog.id.desc())
             .first()
         )
@@ -688,6 +799,7 @@ async def rollback_last_change():
         op = (
             db.query(PlanOperation)
             .filter(PlanOperation.operation_id == last_change.operation_id)
+            .filter(PlanOperation.plan_version_id == active_plan_version_id)
             .first()
         )
 
@@ -715,7 +827,7 @@ async def rollback_last_change():
         )
 
         rollback_log = PlanChangeLog(
-            plan_version_id=last_change.plan_version_id,
+            plan_version_id=active_plan_version_id,
             operation_id=last_change.operation_id,
             old_machine_id=current_machine_id,
             new_machine_id=last_change.old_machine_id,
@@ -798,6 +910,7 @@ async def rollback_last_change():
             "type": "operation_update",
             "data": {
                 "id": op.operation_id,
+                "plan_version_id": active_plan_version_id,
                 "label": (
                     (
                         f"{operation_meta['order_no']} {operation_meta['product_name']}"
@@ -858,9 +971,11 @@ async def rollback_last_change():
 async def rollback_change_set(change_set_id: str):
     db = SessionLocal()
     try:
+        active_plan_version_id = get_active_plan_version_id(db)
         rows = (
             db.query(PlanChangeLog)
             .filter(PlanChangeLog.change_set_id == change_set_id)
+            .filter(PlanChangeLog.plan_version_id == active_plan_version_id)
             .order_by(PlanChangeLog.id.desc())
             .all()
         )
@@ -888,6 +1003,7 @@ async def rollback_change_set(change_set_id: str):
             op = (
                 db.query(PlanOperation)
                 .filter(PlanOperation.operation_id == row.operation_id)
+                .filter(PlanOperation.plan_version_id == active_plan_version_id)
                 .first()
             )
 
@@ -915,7 +1031,7 @@ async def rollback_change_set(change_set_id: str):
 
             rollback_log = PlanChangeLog(
                 change_set_id=rollback_change_set_id,
-                plan_version_id=row.plan_version_id,
+                plan_version_id=active_plan_version_id,
                 operation_id=row.operation_id,
                 old_machine_id=current_machine_id,
                 new_machine_id=row.old_machine_id,
@@ -931,6 +1047,7 @@ async def rollback_change_set(change_set_id: str):
 
             updated_by_operation_id[op.operation_id] = {
                 "id": op.operation_id,
+                "plan_version_id": active_plan_version_id,
                 "machine": op.machine_id,
                 "start": int(op.start_time),
                 "end": int(op.end_time),
@@ -975,7 +1092,10 @@ def get_plan_change_log(
 ):
     db = SessionLocal()
     try:
-        query = db.query(PlanChangeLog)
+        active_plan_version_id = get_active_plan_version_id(db)
+        query = db.query(PlanChangeLog).filter(
+            PlanChangeLog.plan_version_id == active_plan_version_id
+        )
 
         if operation_id is not None:
             query = query.filter(PlanChangeLog.operation_id == operation_id)

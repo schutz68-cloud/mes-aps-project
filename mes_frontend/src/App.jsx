@@ -31,6 +31,7 @@ function App() {
   const [freezeInput, setFreezeInput] = useState("");
   const [historyFilters, setHistoryFilters] = useState(DEFAULT_HISTORY_FILTERS);
   const [operationFilter, setOperationFilter] = useState("");
+  const [activePlanVersion, setActivePlanVersion] = useState(null);
 
   const moveDebounceRef = useRef(new Map());
 
@@ -86,11 +87,19 @@ function App() {
       .catch(() => {});
   }, []);
 
+  const loadActivePlanVersion = useCallback(() => {
+    fetch("http://127.0.0.1:8000/plan_versions/active")
+      .then((res) => res.json())
+      .then((data) => setActivePlanVersion(data))
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     loadOperations();
     loadChangeLog();
     loadFreezeHorizon();
-  }, [loadOperations, loadChangeLog, loadFreezeHorizon]);
+    loadActivePlanVersion();
+  }, [loadOperations, loadChangeLog, loadFreezeHorizon, loadActivePlanVersion]);
 
   useEffect(() => {
     let disposed = false;
@@ -227,34 +236,6 @@ function App() {
     [loadChangeLog]
   );
 
-  const handleRollback = useCallback(async () => {
-    try {
-      const res = await fetch("http://127.0.0.1:8000/rollback_last_change", {
-        method: "POST",
-      });
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        alert("Откат не выполнен: " + JSON.stringify(data));
-        return;
-      }
-
-      if (data.operation) {
-        setOps((prev) =>
-          prev.map((op) =>
-            op.id === data.operation.id ? { ...op, ...data.operation } : op
-          )
-        );
-      }
-
-      loadChangeLog();
-    } catch (error) {
-      console.error("Ошибка отката:", error);
-      alert("Не удалось выполнить откат");
-    }
-  }, [loadChangeLog]);
-
   const handleRollbackChangeSet = useCallback(
     async (changeSetId) => {
       try {
@@ -375,16 +356,6 @@ function App() {
         }}
       >
         <button
-          onClick={handleRollback}
-          style={{
-            padding: "8px 12px",
-            cursor: "pointer",
-          }}
-        >
-          Откатить последнюю операцию
-        </button>
-
-        <button
           onClick={() => {
             if (!latestRollbackChangeGroup?.change_set_id) {
               alert("Нет доступной группы изменений для отката");
@@ -423,6 +394,18 @@ function App() {
         >
           {showHistory ? "Скрыть историю изменений" : "История изменений"}
         </button>
+
+        <div
+          style={{
+            padding: "8px",
+            border: "1px solid #ccc",
+          }}
+        >
+          Активный план:{" "}
+          {activePlanVersion
+            ? `#${activePlanVersion.id} ${activePlanVersion.name || ""}`
+            : "не загружен"}
+        </div>
 
         <div
           style={{

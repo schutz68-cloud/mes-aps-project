@@ -42,6 +42,19 @@ class PlanChangeLog(Base):
     rollback_reason = Column(String)
 
 
+class PlanVersion(Base):
+    __tablename__ = "plan_versions"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    status = Column(String)
+    created_at = Column(DateTime, server_default=func.now())
+    created_by = Column(String)
+    approved_at = Column(DateTime)
+    approved_by = Column(String)
+    description = Column(String)
+
+
 class SystemSetting(Base):
     __tablename__ = "system_settings"
 

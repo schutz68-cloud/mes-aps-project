@@ -17,9 +17,33 @@ def init_db_schema():
 
     statements = []
 
+    if "plan_versions" in table_names:
+        columns = {column["name"] for column in inspector.get_columns("plan_versions")}
+
+        if "name" not in columns:
+            statements.append("ALTER TABLE plan_versions ADD COLUMN name TEXT")
+        if "status" not in columns:
+            statements.append("ALTER TABLE plan_versions ADD COLUMN status TEXT")
+        if "created_at" not in columns:
+            statements.append(
+                "ALTER TABLE plan_versions ADD COLUMN created_at TIMESTAMP DEFAULT now()"
+            )
+        if "created_by" not in columns:
+            statements.append("ALTER TABLE plan_versions ADD COLUMN created_by TEXT")
+        if "approved_at" not in columns:
+            statements.append("ALTER TABLE plan_versions ADD COLUMN approved_at TIMESTAMP")
+        if "approved_by" not in columns:
+            statements.append("ALTER TABLE plan_versions ADD COLUMN approved_by TEXT")
+        if "description" not in columns:
+            statements.append("ALTER TABLE plan_versions ADD COLUMN description TEXT")
+
     if "plan_change_log" in table_names:
         columns = {column["name"] for column in inspector.get_columns("plan_change_log")}
 
+        if "plan_version_id" not in columns:
+            statements.append(
+                "ALTER TABLE plan_change_log ADD COLUMN plan_version_id INTEGER"
+            )
         if "change_set_id" not in columns:
             statements.append("ALTER TABLE plan_change_log ADD COLUMN change_set_id TEXT")
         if "is_rolled_back" not in columns:
@@ -35,6 +59,8 @@ def init_db_schema():
     if "plan_operations" in table_names:
         columns = {column["name"] for column in inspector.get_columns("plan_operations")}
 
+        if "plan_version_id" not in columns:
+            statements.append("ALTER TABLE plan_operations ADD COLUMN plan_version_id INTEGER")
         if "is_locked" not in columns:
             statements.append(
                 "ALTER TABLE plan_operations "
@@ -46,6 +72,38 @@ def init_db_schema():
     with engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))
+
+        connection.execute(
+            text(
+                """
+                INSERT INTO plan_versions (
+                    id,
+                    name,
+                    status,
+                    created_by,
+                    description
+                )
+                VALUES (
+                    1,
+                    'Основной план',
+                    'active',
+                    'system',
+                    'Текущая активная версия плана'
+                )
+                ON CONFLICT (id) DO NOTHING
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                UPDATE plan_operations
+                SET plan_version_id = 1
+                WHERE plan_version_id IS NULL
+                """
+            )
+        )
 
         connection.execute(
             text(
