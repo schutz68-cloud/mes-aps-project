@@ -8,7 +8,7 @@ SessionLocal = sessionmaker(bind=engine)
 
 
 def init_db_schema():
-    from models import Base
+    from app.models import Base
 
     Base.metadata.create_all(bind=engine)
 

@@ -1,10 +1,16 @@
+# Python virtual environments
+.venv/
 venv/
+mes_backend/.venv/
+
+# Python cache
 __pycache__/
 *.pyc
+
+# Environment files
 .env
 
+# Node
 node_modules/
 dist/
 build/
-
-.vscode/

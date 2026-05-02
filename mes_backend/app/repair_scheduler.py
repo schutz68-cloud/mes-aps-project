@@ -2,7 +2,7 @@ from math import ceil
 
 from sqlalchemy import text
 
-from models import PlanChangeLog
+from app.models import PlanChangeLog
 
 
 INTER_OPERATION_GAP_MINUTES = 15

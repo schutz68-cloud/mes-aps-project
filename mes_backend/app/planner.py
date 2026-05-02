@@ -1,4 +1,4 @@
-from websocket import broadcast_sync
+from app.websocket import broadcast_sync
 from ortools.sat.python import cp_model
 import time
 

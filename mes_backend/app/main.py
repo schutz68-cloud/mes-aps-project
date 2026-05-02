@@ -3,10 +3,10 @@ from pydantic import BaseModel
 from typing import Optional
 from uuid import uuid4
 from fastapi.middleware.cors import CORSMiddleware
-from db import SessionLocal, init_db_schema
-from models import PlanOperation, PlanChangeLog, SystemSetting
-from repair_scheduler import RepairSchedulerError, repair_plan_after_manual_move
-from websocket import connect, disconnect, broadcast_sync
+from app.db import SessionLocal, init_db_schema
+from app.models import PlanOperation, PlanChangeLog, SystemSetting
+from app.repair_scheduler import RepairSchedulerError, repair_plan_after_manual_move
+from app.websocket import connect, disconnect, broadcast_sync
 from sqlalchemy import text
 from math import ceil
 
