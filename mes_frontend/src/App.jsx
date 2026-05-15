@@ -3,6 +3,7 @@ import Gantt from "./Gantt";
 
 const MOVE_DEBOUNCE_MS = 350;
 const HISTORY_LIMIT = 50;
+const SELECTED_PLAN_VERSION_STORAGE_KEY = "aps_mes_selected_plan_version_id";
 const DEFAULT_HISTORY_FILTERS = {
   operationId: "",
   machine: "",
@@ -16,6 +17,22 @@ const OPERATION_NAMES = {
   FACING: "Торцовка",
   HEAT: "Термичка",
   COATING: "Покрытие",
+};
+
+const formatMinutesDelta = (value) => {
+  const minutes = Number(value || 0);
+
+  if (minutes > 0) return `+${minutes} мин.`;
+  if (minutes < 0) return `${minutes} мин.`;
+  return "0 мин.";
+};
+
+const getPlanFinishDeltaText = (value) => {
+  const minutes = Number(value || 0);
+
+  if (minutes > 0) return `хуже на ${minutes} мин.`;
+  if (minutes < 0) return `лучше на ${Math.abs(minutes)} мин.`;
+  return "без изменений";
 };
 
 // Временная роль до полноценной авторизации.
@@ -32,10 +49,21 @@ function App() {
   const [historyFilters, setHistoryFilters] = useState(DEFAULT_HISTORY_FILTERS);
   const [operationFilter, setOperationFilter] = useState("");
   const [activePlanVersion, setActivePlanVersion] = useState(null);
+  const [planVersions, setPlanVersions] = useState([]);
+  const [selectedPlanVersionId, setSelectedPlanVersionId] = useState("");
+  const [machines, setMachines] = useState([]);
+  const [planDiff, setPlanDiff] = useState(null);
+  const [showPlanDiff, setShowPlanDiff] = useState(false);
+  const [isPlanDiffLoading, setIsPlanDiffLoading] = useState(false);
 
   const moveDebounceRef = useRef(new Map());
 
   const canEditFreezeZone = CURRENT_USER_ROLE === "production_manager";
+  const selectedPlanVersion = planVersions.find(
+    (version) => String(version.id) === String(selectedPlanVersionId)
+  );
+  const selectedPlanVersionStatus = selectedPlanVersion?.status || "";
+  const canEditSelectedPlan = selectedPlanVersionStatus === "draft";
   const operationGroups = Array.from(
     new Set(ops.map((op) => op.operation_type).filter(Boolean))
   ).sort();
@@ -43,17 +71,25 @@ function App() {
     ? ops.filter((op) => op.operation_type === operationFilter)
     : ops;
 
-  const loadOperations = useCallback(() => {
-    fetch("http://127.0.0.1:8000/operations")
+  const loadOperations = useCallback((planVersionId = selectedPlanVersionId) => {
+    const url = planVersionId
+      ? `http://127.0.0.1:8000/operations?plan_version_id=${planVersionId}`
+      : "http://127.0.0.1:8000/operations";
+
+    fetch(url)
       .then((res) => res.json())
       .then((data) => {
         setOps(Array.isArray(data) ? data : []);
       })
       .catch(() => {});
-  }, []);
+  }, [selectedPlanVersionId]);
 
   const loadChangeLog = useCallback(() => {
     const params = new URLSearchParams({ limit: String(HISTORY_LIMIT) });
+
+    if (selectedPlanVersionId) {
+      params.set("plan_version_id", selectedPlanVersionId);
+    }
 
     if (historyFilters.operationId.trim()) {
       params.set("operation_id", historyFilters.operationId.trim());
@@ -74,7 +110,7 @@ function App() {
         setChangeLog(Array.isArray(data) ? data : []);
       })
       .catch(() => {});
-  }, [historyFilters]);
+  }, [historyFilters, selectedPlanVersionId]);
 
   const loadFreezeHorizon = useCallback(() => {
     fetch("http://127.0.0.1:8000/settings/freeze_horizon")
@@ -94,12 +130,62 @@ function App() {
       .catch(() => {});
   }, []);
 
+  const loadMachines = useCallback(() => {
+    fetch("http://127.0.0.1:8000/machines")
+      .then((res) => res.json())
+      .then((data) => {
+        setMachines(Array.isArray(data) ? data : []);
+      })
+      .catch(() => {});
+  }, []);
+
+  const loadPlanVersions = useCallback(() => {
+    fetch("http://127.0.0.1:8000/plan_versions")
+      .then((res) => res.json())
+      .then((data) => {
+        const versions = Array.isArray(data) ? data : [];
+        setPlanVersions(versions);
+
+        setSelectedPlanVersionId((current) => {
+          if (
+            current &&
+            versions.some((version) => String(version.id) === String(current))
+          ) {
+            return current;
+          }
+
+          const stored = localStorage.getItem(SELECTED_PLAN_VERSION_STORAGE_KEY);
+          if (
+            stored &&
+            versions.some((version) => String(version.id) === String(stored))
+          ) {
+            return stored;
+          }
+
+          const active = versions.find((version) => version.status === "active");
+          const activeId = active ? String(active.id) : "";
+          if (activeId) {
+            localStorage.setItem(SELECTED_PLAN_VERSION_STORAGE_KEY, activeId);
+          } else {
+            localStorage.removeItem(SELECTED_PLAN_VERSION_STORAGE_KEY);
+          }
+          return activeId;
+        });
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    loadFreezeHorizon();
+    loadActivePlanVersion();
+    loadPlanVersions();
+    loadMachines();
+  }, [loadFreezeHorizon, loadActivePlanVersion, loadPlanVersions, loadMachines]);
+
   useEffect(() => {
     loadOperations();
     loadChangeLog();
-    loadFreezeHorizon();
-    loadActivePlanVersion();
-  }, [loadOperations, loadChangeLog, loadFreezeHorizon, loadActivePlanVersion]);
+  }, [loadOperations, loadChangeLog]);
 
   useEffect(() => {
     let disposed = false;
@@ -111,6 +197,13 @@ function App() {
       const msg = JSON.parse(event.data);
 
       if (msg.type === "operation_update") {
+        if (
+          selectedPlanVersionId &&
+          String(msg.data.plan_version_id) !== String(selectedPlanVersionId)
+        ) {
+          return;
+        }
+
         setOps((prev) => {
           const idx = prev.findIndex((op) => op.id === msg.data.id);
           if (idx === -1) return [...prev, msg.data];
@@ -124,11 +217,21 @@ function App() {
       }
       if (msg.type === "plan_operations_updated") {
         const updates = Array.isArray(msg.data) ? msg.data : [];
+        const visibleUpdates = selectedPlanVersionId
+          ? updates.filter(
+              (update) =>
+                String(update.plan_version_id) === String(selectedPlanVersionId)
+            )
+          : updates;
+
+        if (visibleUpdates.length === 0) {
+          return;
+        }
 
         setOps((prev) => {
           const byId = new Map(prev.map((op) => [op.id, op]));
 
-          for (const update of updates) {
+          for (const update of visibleUpdates) {
             const existing = byId.get(update.id);
             byId.set(update.id, existing ? { ...existing, ...update } : update);
           }
@@ -159,7 +262,7 @@ function App() {
         ws.close(1000, "Component unmount");
       }
     };
-  }, [loadChangeLog]);
+  }, [loadChangeLog, selectedPlanVersionId]);
 
   useEffect(() => {
     return () => {
@@ -173,8 +276,53 @@ function App() {
     };
   }, []);
 
+  const loadPlanDiff = useCallback(async () => {
+    if (showPlanDiff) {
+      setShowPlanDiff(false);
+      setPlanDiff(null);
+      return;
+    }
+
+    if (!selectedPlanVersionId || !canEditSelectedPlan) {
+      alert("Сравнение доступно только для черновой версии плана");
+      return;
+    }
+
+    setIsPlanDiffLoading(true);
+
+    try {
+      const res = await fetch(
+        `http://127.0.0.1:8000/plan_versions/${selectedPlanVersionId}/diff`
+      );
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        alert(
+          "Не удалось сравнить версии плана: " +
+            (data?.detail || JSON.stringify(data))
+        );
+        return;
+      }
+
+      setPlanDiff(data);
+      setShowPlanDiff(true);
+    } catch (error) {
+      console.error("Ошибка сравнения версий плана:", error);
+      alert("Не удалось сравнить версии плана");
+    } finally {
+      setIsPlanDiffLoading(false);
+    }
+  }, [selectedPlanVersionId, canEditSelectedPlan, showPlanDiff]);
+
   const handleMove = useCallback(
     (op) => {
+      if (!canEditSelectedPlan) {
+        return Promise.reject(
+          new Error("Редактировать можно только черновую версию плана")
+        );
+      }
+
       return new Promise((resolve, reject) => {
         const key = op.id;
         const prev = moveDebounceRef.current.get(key);
@@ -189,12 +337,15 @@ function App() {
 
         const timer = setTimeout(async () => {
           try {
-            const res = await fetch(`http://127.0.0.1:8000/update_op/${op.id}`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(op),
-              signal: controller.signal,
-            });
+            const res = await fetch(
+              `http://127.0.0.1:8000/update_op/${op.id}?plan_version_id=${selectedPlanVersionId}`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(op),
+                signal: controller.signal,
+              }
+            );
 
             if (!res.ok) {
               let errorData = null;
@@ -215,9 +366,40 @@ function App() {
               );
             }
 
-            loadChangeLog();
+            const data = await res.json();
+            const updates = Array.isArray(data.changed_operations)
+              ? data.changed_operations
+              : data.operation
+              ? [data.operation]
+              : [];
 
-            resolve({ ok: true });
+            if (updates.length > 0) {
+              setOps((prevOps) => {
+                const byId = new Map(
+                  prevOps.map((existingOp) => [existingOp.id, existingOp])
+                );
+
+                for (const update of updates) {
+                  if (
+                    selectedPlanVersionId &&
+                    String(update.plan_version_id) !== String(selectedPlanVersionId)
+                  ) {
+                    continue;
+                  }
+
+                  const existing = byId.get(update.id);
+                  byId.set(update.id, existing ? { ...existing, ...update } : update);
+                }
+
+                return Array.from(byId.values());
+              });
+            }
+
+            loadChangeLog();
+            setPlanDiff(null);
+            setShowPlanDiff(false);
+
+            resolve({ ok: true, data });
           } catch (e) {
             if (e.name === "AbortError") resolve({ aborted: true });
             else reject(e);
@@ -233,14 +415,19 @@ function App() {
         moveDebounceRef.current.set(key, { timer, controller, resolve });
       });
     },
-    [loadChangeLog]
+    [loadChangeLog, canEditSelectedPlan, selectedPlanVersionId]
   );
 
   const handleRollbackChangeSet = useCallback(
     async (changeSetId) => {
+      if (!canEditSelectedPlan) {
+        alert("Откат группы изменений можно выполнять только в черновой версии плана");
+        return;
+      }
+
       try {
         const res = await fetch(
-          `http://127.0.0.1:8000/plan_change_log/change_set/${changeSetId}/rollback`,
+          `http://127.0.0.1:8000/plan_change_log/change_set/${changeSetId}/rollback?plan_version_id=${selectedPlanVersionId}`,
           { method: "POST" }
         );
 
@@ -271,14 +458,50 @@ function App() {
         });
 
         loadChangeLog();
+        setPlanDiff(null);
+        setShowPlanDiff(false);
         alert("Группа изменений откатана");
       } catch (error) {
         console.error("Ошибка отката группы изменений:", error);
         alert("Не удалось откатить группу изменений");
       }
     },
-    [loadChangeLog]
+    [loadChangeLog, canEditSelectedPlan, selectedPlanVersionId]
   );
+
+  const handleCloneActivePlan = useCallback(async () => {
+    try {
+      const res = await fetch("http://127.0.0.1:8000/plan_versions/clone_active", {
+        method: "POST",
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        alert(
+          "Не удалось создать копию активного плана: " +
+            (data?.detail || JSON.stringify(data))
+        );
+        return;
+      }
+
+      const newVersion = data.plan_version;
+
+      await loadPlanVersions();
+      localStorage.setItem(
+        SELECTED_PLAN_VERSION_STORAGE_KEY,
+        String(newVersion.id)
+      );
+      setSelectedPlanVersionId(String(newVersion.id));
+      setPlanDiff(null);
+      setShowPlanDiff(false);
+
+      alert("Создана черновая копия активного плана");
+    } catch (error) {
+      console.error("Ошибка создания копии активного плана:", error);
+      alert("Не удалось создать копию активного плана");
+    }
+  }, [loadPlanVersions]);
 
   const handleSaveFreezeHorizon = useCallback(async () => {
     const minutes = Number(freezeInput);
@@ -364,7 +587,7 @@ function App() {
 
             handleRollbackChangeSet(latestRollbackChangeGroup.change_set_id);
           }}
-          disabled={!latestRollbackChangeGroup}
+          disabled={!latestRollbackChangeGroup || !canEditSelectedPlan}
           title={
             latestRollbackChangeGroup?.change_set_id
               ? latestRollbackChangeGroup.change_set_id
@@ -372,7 +595,10 @@ function App() {
           }
           style={{
             padding: "8px 12px",
-            cursor: latestRollbackChangeGroup ? "pointer" : "not-allowed",
+            cursor:
+              latestRollbackChangeGroup && canEditSelectedPlan
+                ? "pointer"
+                : "not-allowed",
           }}
         >
           Откатить последнюю группу
@@ -405,6 +631,73 @@ function App() {
           {activePlanVersion
             ? `#${activePlanVersion.id} ${activePlanVersion.name || ""}`
             : "не загружен"}
+        </div>
+
+        <div
+          style={{
+            display: "flex",
+            gap: "8px",
+            alignItems: "center",
+            padding: "8px",
+            border: "1px solid #ccc",
+          }}
+        >
+          <span>Версия для просмотра:</span>
+
+          <select
+            value={selectedPlanVersionId}
+            onChange={(e) => {
+              const value = e.target.value;
+              setSelectedPlanVersionId(value);
+              setPlanDiff(null);
+              setShowPlanDiff(false);
+
+              if (value) {
+                localStorage.setItem(SELECTED_PLAN_VERSION_STORAGE_KEY, value);
+              } else {
+                localStorage.removeItem(SELECTED_PLAN_VERSION_STORAGE_KEY);
+              }
+            }}
+            style={{ padding: "6px", minWidth: "220px" }}
+          >
+            <option value="">Активная версия</option>
+            {planVersions.map((version) => (
+              <option key={version.id} value={String(version.id)}>
+                #{version.id} {version.name || "Без названия"} ({version.status})
+              </option>
+            ))}
+          </select>
+
+          <button
+            onClick={handleCloneActivePlan}
+            style={{ padding: "6px 10px", cursor: "pointer" }}
+          >
+            Создать копию active
+          </button>
+
+          <button
+            onClick={loadPlanDiff}
+            disabled={!canEditSelectedPlan || isPlanDiffLoading}
+            style={{
+              padding: "8px 12px",
+              cursor:
+                canEditSelectedPlan && !isPlanDiffLoading
+                  ? "pointer"
+                  : "not-allowed",
+            }}
+          >
+            {isPlanDiffLoading
+              ? "Сравнение..."
+              : showPlanDiff
+              ? "Скрыть сравнение"
+              : "Сравнить с active"}
+          </button>
+
+          <span style={{ color: canEditSelectedPlan ? "#2e7d32" : "#777" }}>
+            {canEditSelectedPlan
+              ? "Черновик можно редактировать"
+              : "Active доступен только для просмотра"}
+          </span>
         </div>
 
         <div
@@ -470,6 +763,208 @@ function App() {
           </select>
         </div>
       </div>
+
+      {showPlanDiff && planDiff && (
+        <div
+          style={{
+            marginBottom: "16px",
+            border: "1px solid #ccc",
+            padding: "12px",
+            maxHeight: "320px",
+            overflow: "auto",
+          }}
+        >
+          <h3 style={{ marginTop: 0 }}>
+            Сравнение draft #{planDiff.draft_plan_version?.id} с active #
+            {planDiff.active_plan_version?.id}
+          </h3>
+
+          <div style={{ marginBottom: "16px" }}>
+            <h4 style={{ margin: "0 0 8px" }}>Итоги плана</h4>
+            <div>
+              Окончание плана: active{" "}
+              {planDiff.summary?.plan_finish_active ?? 0} → draft{" "}
+              {planDiff.summary?.plan_finish_draft ?? 0},{" "}
+              {getPlanFinishDeltaText(planDiff.summary?.plan_finish_delta)}
+            </div>
+            <div>
+              Изменено операций: {planDiff.summary?.changed_operations ?? 0} из{" "}
+              {planDiff.summary?.total_operations ?? 0}
+            </div>
+            <div>
+              Затронуто заказов: {planDiff.summary?.affected_orders ?? 0};{" "}
+              операций позже: {planDiff.summary?.operations_finished_later ?? 0};{" "}
+              операций раньше: {planDiff.summary?.operations_finished_earlier ?? 0}
+            </div>
+            <div>
+              Смен станка: {planDiff.summary?.machine_changed ?? 0};{" "}
+              просроченных заказов: active{" "}
+              {planDiff.summary?.late_orders_active ?? 0} → draft{" "}
+              {planDiff.summary?.late_orders_draft ?? 0}
+            </div>
+            <div>
+              Суммарное опоздание: active{" "}
+              {planDiff.summary?.total_lateness_active ?? 0} → draft{" "}
+              {planDiff.summary?.total_lateness_draft ?? 0}
+            </div>
+          </div>
+
+          <div style={{ marginBottom: "16px" }}>
+            <h4 style={{ margin: "0 0 8px" }}>Влияние на заказы</h4>
+            {Array.isArray(planDiff.order_impacts) &&
+            planDiff.order_impacts.length > 0 ? (
+              <table
+                style={{
+                  width: "100%",
+                  borderCollapse: "collapse",
+                  fontSize: "14px",
+                  marginBottom: "12px",
+                }}
+              >
+                <thead>
+                  <tr>
+                    <th style={thStyle}>Заказ</th>
+                    <th style={thStyle}>Изделие</th>
+                    <th style={thStyle}>Окончание active</th>
+                    <th style={thStyle}>Окончание draft</th>
+                    <th style={thStyle}>Δ</th>
+                    <th style={thStyle}>Просрочка active</th>
+                    <th style={thStyle}>Просрочка draft</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {planDiff.order_impacts.map((row) => (
+                    <tr key={row.order_id}>
+                      <td style={tdStyle}>{row.order_no || row.order_id}</td>
+                      <td style={tdStyle}>
+                        {row.product_name || row.product_id}
+                      </td>
+                      <td style={tdStyle}>{row.active_finish}</td>
+                      <td style={tdStyle}>{row.draft_finish}</td>
+                      <td style={tdStyle}>
+                        {formatMinutesDelta(row.finish_delta)}
+                      </td>
+                      <td style={tdStyle}>{row.active_lateness}</td>
+                      <td style={tdStyle}>{row.draft_lateness}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <div>Окончание заказов не изменилось</div>
+            )}
+          </div>
+
+          <div style={{ marginBottom: "16px" }}>
+            <h4 style={{ margin: "0 0 8px" }}>Влияние на станки</h4>
+            {Array.isArray(planDiff.machine_impacts) &&
+            planDiff.machine_impacts.length > 0 ? (
+              <table
+                style={{
+                  width: "100%",
+                  borderCollapse: "collapse",
+                  fontSize: "14px",
+                  marginBottom: "12px",
+                }}
+              >
+                <thead>
+                  <tr>
+                    <th style={thStyle}>Станок</th>
+                    <th style={thStyle}>Окончание active</th>
+                    <th style={thStyle}>Окончание draft</th>
+                    <th style={thStyle}>Δ окончания</th>
+                    <th style={thStyle}>Занято active</th>
+                    <th style={thStyle}>Занято draft</th>
+                    <th style={thStyle}>Δ занятости</th>
+                    <th style={thStyle}>Изм. операций</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {planDiff.machine_impacts.map((row) => (
+                    <tr key={row.machine_id}>
+                      <td style={tdStyle}>
+                        {row.machine_name || row.machine_id}
+                      </td>
+                      <td style={tdStyle}>{row.active_finish}</td>
+                      <td style={tdStyle}>{row.draft_finish}</td>
+                      <td style={tdStyle}>
+                        {formatMinutesDelta(row.finish_delta)}
+                      </td>
+                      <td style={tdStyle}>{row.active_busy_minutes}</td>
+                      <td style={tdStyle}>{row.draft_busy_minutes}</td>
+                      <td style={tdStyle}>
+                        {formatMinutesDelta(row.busy_delta)}
+                      </td>
+                      <td style={tdStyle}>{row.changed_operations}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <div>Загрузка станков не изменилась</div>
+            )}
+          </div>
+
+          {Array.isArray(planDiff.items) && planDiff.items.length === 0 ? (
+            <div>Отличий от active-плана нет</div>
+          ) : (
+            <>
+            <h4 style={{ margin: "0 0 8px" }}>Изменённые операции</h4>
+            <table
+              style={{
+                width: "100%",
+                borderCollapse: "collapse",
+                fontSize: "14px",
+              }}
+            >
+              <thead>
+                <tr>
+                  <th style={thStyle}>Заказ</th>
+                  <th style={thStyle}>Изделие</th>
+                  <th style={thStyle}>Операция</th>
+                  <th style={thStyle}>Станок</th>
+                  <th style={thStyle}>Начало</th>
+                  <th style={thStyle}>Окончание</th>
+                  <th style={thStyle}>Δ окончания</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(Array.isArray(planDiff.items) ? planDiff.items : []).map((row) => (
+                  <tr key={row.operation_id}>
+                    <td style={tdStyle}>{row.order_no || row.order_id}</td>
+                    <td style={tdStyle}>
+                      {row.product_name || row.product_id}
+                    </td>
+                    <td style={tdStyle}>
+                      {row.sequence_no}{" "}
+                      {row.operation_name || row.operation_type}
+                    </td>
+                    <td style={tdStyle}>
+                      {row.machine_changed
+                        ? `${row.active_machine} → ${row.draft_machine}`
+                        : row.draft_machine}
+                    </td>
+                    <td style={tdStyle}>
+                      {row.start_changed
+                        ? `${row.active_start} → ${row.draft_start}`
+                        : row.draft_start}
+                    </td>
+                    <td style={tdStyle}>
+                      {row.end_changed
+                        ? `${row.active_end} → ${row.draft_end}`
+                        : row.draft_end}
+                    </td>
+                    <td style={tdStyle}>
+                      {formatMinutesDelta(row.end_delta)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            </>
+          )}
+        </div>
+      )}
 
       {showHistory && (
         <div
@@ -604,7 +1099,11 @@ function App() {
                         ""
                       )}
                     </td>
-                    <td style={tdStyle}>{row.operation_id}</td>
+                    <td style={tdStyle}>
+                      <span title={`operation_id=${row.operation_id}`}>
+                        {row.operation_label || row.operation_id}
+                      </span>
+                    </td>
                     <td style={tdStyle}>
                       {row.change_reason === "manual_gantt_drag"
                         ? "Перемещение"
@@ -650,8 +1149,10 @@ function App() {
 
       <Gantt
         data={filteredOps}
+        machines={machines}
         onMove={handleMove}
         freezeHorizonMinutes={freezeHorizonMinutes}
+        canEdit={canEditSelectedPlan}
       />
     </div>
   );

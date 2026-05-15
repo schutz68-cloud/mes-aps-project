@@ -34,17 +34,41 @@ function getOrderColors(orderId, isFrozen) {
   return ORDER_COLORS[index];
 }
 
-export default function Gantt({ data, onMove, freezeHorizonMinutes }) {
+export default function Gantt({
+  data,
+  machines,
+  onMove,
+  freezeHorizonMinutes,
+  canEdit,
+}) {
   const containerRef = useRef(null);
   const timelineRef = useRef(null);
   const itemsRef = useRef(new DataSet([]));
   const groupsRef = useRef(new DataSet([]));
   const onMoveRef = useRef(onMove);
   const freezeHorizonRef = useRef(freezeHorizonMinutes ?? 0);
+  const canEditRef = useRef(canEdit);
 
   useEffect(() => {
     onMoveRef.current = onMove;
   }, [onMove]);
+
+  useEffect(() => {
+    canEditRef.current = Boolean(canEdit);
+  }, [canEdit]);
+
+  useEffect(() => {
+    if (!timelineRef.current) return;
+
+    timelineRef.current.setOptions({
+      editable: {
+        add: false,
+        updateTime: Boolean(canEdit),
+        updateGroup: Boolean(canEdit),
+        remove: false,
+      },
+    });
+  }, [canEdit]);
 
   useEffect(() => {
     freezeHorizonRef.current = Number(freezeHorizonMinutes ?? 0);
@@ -71,12 +95,18 @@ export default function Gantt({ data, onMove, freezeHorizonMinutes }) {
         selectable: true,
         editable: {
           add: false,
-          updateTime: true,
-          updateGroup: true,
+          updateTime: Boolean(canEditRef.current),
+          updateGroup: Boolean(canEditRef.current),
           remove: false,
         },
         onMove: (item, callback) => {
           const prev = itemsRef.current.get(item.id);
+
+          if (!canEditRef.current) {
+            callback(prev || null);
+            alert("Редактировать можно только черновую версию плана");
+            return;
+          }
 
           if (!prev) {
             callback(null);
@@ -95,13 +125,22 @@ export default function Gantt({ data, onMove, freezeHorizonMinutes }) {
             return;
           }
 
-          callback(item);
+          const previousStart = Number(new Date(prev.start));
+          const previousEnd = Number(new Date(prev.end));
+          const previousDuration = Math.max(previousEnd - previousStart, 60000);
+          const newStart = Number(new Date(item.start));
+          const correctedItem = {
+            ...item,
+            end: newStart + previousDuration,
+          };
+
+          callback(correctedItem);
 
           const payload = {
-            id: item.id,
-            machine: item.group,
-            start: Math.floor(new Date(item.start).getTime() / 60000),
-            end: Math.floor(new Date(item.end).getTime() / 60000),
+            id: correctedItem.id,
+            machine: correctedItem.group,
+            start: Math.floor(Number(new Date(correctedItem.start)) / 60000),
+            end: Math.floor(Number(new Date(correctedItem.end)) / 60000),
           };
 
           Promise.resolve(onMoveRef.current?.(payload)).catch((error) => {
@@ -126,6 +165,14 @@ export default function Gantt({ data, onMove, freezeHorizonMinutes }) {
       FREEZE_LINE_ID
     );
 
+    timeline.on("click", (properties) => {
+      if (!canEditRef.current && properties?.item) {
+        alert(
+          "Active-план доступен только для просмотра. Создайте черновую копию для редактирования."
+        );
+      }
+    });
+
     timelineRef.current = timeline;
 
     return () => {
@@ -142,11 +189,22 @@ export default function Gantt({ data, onMove, freezeHorizonMinutes }) {
     const groupMap = new Map();
     const items = [];
 
+    for (const machine of machines || []) {
+      const groupOrder = MACHINE_GROUP_ORDER[machine.group_id] ?? 999;
+
+      groupMap.set(machine.id, {
+        id: machine.id,
+        content: machine.name || String(machine.id),
+        order: groupOrder,
+      });
+    }
+
     for (const op of data) {
       const start = Number(op.start);
       const end = Number(op.end);
       const duration = Math.max(end - start, 1);
       const setupMinutes = Math.max(Number(op.setup_minutes ?? 0), 0);
+      const runMinutes = Math.max(duration - setupMinutes, 0);
       const setupPercent = Math.min((setupMinutes / duration) * 100, 100);
       const isFrozen = start < freezeHorizon;
       const colors = getOrderColors(op.order_id, isFrozen);
@@ -162,9 +220,9 @@ export default function Gantt({ data, onMove, freezeHorizonMinutes }) {
         id: op.id,
         group: op.machine,
         content: op.label || String(op.id),
-        title: `${op.operation_name || op.operation_type || ""}${
-          setupMinutes > 0 ? `, наладка ${setupMinutes} мин.` : ""
-        }`,
+        title: `${
+          op.operation_name || op.operation_type || ""
+        }, наладка ${setupMinutes} мин., выполнение ${runMinutes} мин.`,
         start: start * 60000,
         end: end * 60000,
         type: "range",
@@ -197,7 +255,7 @@ export default function Gantt({ data, onMove, freezeHorizonMinutes }) {
         animation: false,
       });
     }
-  }, [data, freezeHorizonMinutes]);
+  }, [data, machines, freezeHorizonMinutes]);
 
   return (
     <>
@@ -226,6 +284,18 @@ export default function Gantt({ data, onMove, freezeHorizonMinutes }) {
           }
         `}
       </style>
+      {!canEdit && (
+        <div
+          style={{
+            marginBottom: "8px",
+            padding: "8px",
+            border: "1px solid #ccc",
+            background: "#f7f7f7",
+          }}
+        >
+          Режим просмотра: active-план нельзя изменять. Создайте черновую копию для редактирования.
+        </div>
+      )}
       <div
         ref={containerRef}
         style={{ height: "500px", border: "1px solid gray" }}

@@ -95,6 +95,14 @@ def init_db_schema():
             )
         )
 
+        connection.execute(text("""
+                SELECT setval(
+                    pg_get_serial_sequence('plan_versions', 'id'),
+                    COALESCE((SELECT MAX(id) FROM plan_versions), 1),
+                    true
+                )
+                """))
+
         connection.execute(
             text(
                 """

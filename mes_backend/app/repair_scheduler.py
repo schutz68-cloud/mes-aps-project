@@ -5,7 +5,8 @@ from sqlalchemy import text
 from app.models import PlanChangeLog
 
 
-INTER_OPERATION_GAP_MINUTES = 15
+INTER_OPERATION_GAP_MINUTES = 30
+MACHINE_OPERATION_GAP_MINUTES = 15
 MAX_ITERATIONS = 1000
 
 
@@ -23,7 +24,7 @@ def _calculate_duration(operation):
     )
 
 
-def _load_operations(db, active_plan_version_id):
+def _load_operations(db, plan_version_id):
     rows = db.execute(
         text(
             """
@@ -37,6 +38,13 @@ def _load_operations(db, active_plan_version_id):
                 po.lock_reason,
                 oo.order_item_id,
                 oo.sequence_no,
+                CASE
+                    WHEN oo.sequence_no = MIN(oo.sequence_no) OVER (
+                        PARTITION BY oo.order_item_id
+                    )
+                    THEN true
+                    ELSE false
+                END AS is_first_order_item_operation,
                 oo.quantity,
                 oo.operation_type,
                 oi.product_id,
@@ -53,7 +61,7 @@ def _load_operations(db, active_plan_version_id):
             ORDER BY po.start_time, po.operation_id
             """
         ),
-        {"plan_version_id": active_plan_version_id},
+        {"plan_version_id": plan_version_id},
     ).mappings().all()
 
     operations = []
@@ -66,10 +74,24 @@ def _load_operations(db, active_plan_version_id):
         operation = dict(row)
         operation["start_time"] = int(operation["start_time"])
         operation["end_time"] = int(operation["end_time"])
+        operation["is_first_order_item_operation"] = bool(
+            operation["is_first_order_item_operation"]
+        )
         operation["duration_minutes"] = _calculate_duration(operation)
         operations.append(operation)
 
     return operations
+
+
+def _get_machine_required_start(previous_operation, operation):
+    if operation["is_first_order_item_operation"]:
+        return (
+            previous_operation["start_time"]
+            + int(previous_operation["setup_minutes"] or 0)
+            + MACHINE_OPERATION_GAP_MINUTES
+        )
+
+    return previous_operation["end_time"] + MACHINE_OPERATION_GAP_MINUTES
 
 
 def _assert_can_shift(operation, freeze_horizon_minutes):
@@ -85,7 +107,7 @@ def _assert_can_shift(operation, freeze_horizon_minutes):
 
 
 def _shift_operation(
-    db, operation, new_start, changed_operations, change_set_id, active_plan_version_id
+    db, operation, new_start, changed_operations, change_set_id, plan_version_id
 ):
     if new_start <= operation["start_time"]:
         return False
@@ -107,7 +129,7 @@ def _shift_operation(
         ),
         {
             "operation_id": operation["operation_id"],
-            "plan_version_id": active_plan_version_id,
+            "plan_version_id": plan_version_id,
             "start_time": new_start,
             "end_time": new_end,
         },
@@ -116,7 +138,7 @@ def _shift_operation(
     db.add(
         PlanChangeLog(
             change_set_id=change_set_id,
-            plan_version_id=active_plan_version_id,
+            plan_version_id=plan_version_id,
             operation_id=operation["operation_id"],
             old_machine_id=old_machine_id,
             new_machine_id=old_machine_id,
@@ -132,7 +154,7 @@ def _shift_operation(
     operation["end_time"] = new_end
     changed_operations[operation["operation_id"]] = {
         "id": operation["operation_id"],
-        "plan_version_id": active_plan_version_id,
+        "plan_version_id": plan_version_id,
         "machine": operation["machine_id"],
         "start": operation["start_time"],
         "end": operation["end_time"],
@@ -155,10 +177,12 @@ def _validate_plan(operations):
         )
         previous = None
         for operation in ordered:
-            if previous and operation["start_time"] < previous["end_time"]:
-                raise RepairSchedulerError(
-                    "Невозможно восстановить допустимый план после изменения"
-                )
+            if previous:
+                required_start = _get_machine_required_start(previous, operation)
+                if operation["start_time"] < required_start:
+                    raise RepairSchedulerError(
+                        "Невозможно восстановить допустимый план после изменения"
+                    )
             previous = operation
 
     for item_operations in by_order_item.values():
@@ -184,9 +208,9 @@ def repair_plan_after_manual_move(
     changed_operation_id: int,
     freeze_horizon_minutes: int,
     change_set_id: str,
-    active_plan_version_id: int,
+    plan_version_id: int,
 ) -> list[dict]:
-    operations = _load_operations(db, active_plan_version_id)
+    operations = _load_operations(db, plan_version_id)
     changed_operations = {}
 
     if not any(op["operation_id"] == changed_operation_id for op in operations):
@@ -217,7 +241,7 @@ def repair_plan_after_manual_move(
                                 required_start,
                                 changed_operations,
                                 change_set_id,
-                                active_plan_version_id,
+                                plan_version_id,
                             )
                             or moved
                         )
@@ -234,19 +258,21 @@ def repair_plan_after_manual_move(
             )
             previous = None
             for operation in ordered:
-                if previous and previous["end_time"] > operation["start_time"]:
-                    _assert_can_shift(operation, freeze_horizon_minutes)
-                    moved = (
-                        _shift_operation(
-                            db,
-                            operation,
-                            previous["end_time"],
-                            changed_operations,
-                            change_set_id,
-                            active_plan_version_id,
+                if previous:
+                    required_start = _get_machine_required_start(previous, operation)
+                    if required_start > operation["start_time"]:
+                        _assert_can_shift(operation, freeze_horizon_minutes)
+                        moved = (
+                            _shift_operation(
+                                db,
+                                operation,
+                                required_start,
+                                changed_operations,
+                                change_set_id,
+                                plan_version_id,
+                            )
+                            or moved
                         )
-                        or moved
-                    )
                 previous = operation
 
         if not moved:

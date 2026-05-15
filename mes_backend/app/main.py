@@ -39,7 +39,8 @@ class FreezeHorizonPayload(BaseModel):
 DEFAULT_FREEZE_HORIZON_MINUTES = 200
 FREEZE_HORIZON_SETTING_KEY = "freeze_horizon_minutes"
 PRODUCTION_MANAGER_ROLE = "production_manager"
-INTER_OPERATION_GAP_MINUTES = 15
+INTER_OPERATION_GAP_MINUTES = 30
+MACHINE_OPERATION_GAP_MINUTES = 15
 
 
 def get_freeze_horizon_minutes(db) -> int:
@@ -126,6 +127,30 @@ def serialize_plan_version(plan_version):
     }
 
 
+def get_plan_version_or_404(db, plan_version_id: int) -> PlanVersion:
+    plan_version = (
+        db.query(PlanVersion)
+        .filter(PlanVersion.id == plan_version_id)
+        .first()
+    )
+
+    if not plan_version:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Версия плана {plan_version_id} не найдена",
+        )
+
+    return plan_version
+
+
+def get_requested_plan_version_id(db, plan_version_id: Optional[int]) -> int:
+    if plan_version_id is None:
+        return get_active_plan_version_id(db)
+
+    get_plan_version_or_404(db, plan_version_id)
+    return int(plan_version_id)
+
+
 # ======================
 # CORS
 # ======================
@@ -176,6 +201,456 @@ def get_active_plan_version():
                 detail="Активная версия плана не найдена",
             )
         return serialize_plan_version(active_version)
+    finally:
+        db.close()
+
+
+@app.post("/plan_versions/clone_active")
+def clone_active_plan_version():
+    db = SessionLocal()
+    try:
+        active_plan_version_id = get_active_plan_version_id(db)
+        active_version = get_plan_version_or_404(db, active_plan_version_id)
+
+        draft_version = PlanVersion(
+            name=f"Копия плана #{active_version.id}",
+            status="draft",
+            created_by="system",
+            description=f"Копия активной версии плана #{active_version.id}",
+        )
+        db.add(draft_version)
+        db.flush()
+
+        copied_rows = db.execute(
+            text(
+                """
+                INSERT INTO plan_operations (
+                    plan_version_id,
+                    operation_id,
+                    machine_id,
+                    start_time,
+                    end_time,
+                    is_locked,
+                    lock_reason
+                )
+                SELECT
+                    :draft_plan_version_id,
+                    operation_id,
+                    machine_id,
+                    start_time,
+                    end_time,
+                    is_locked,
+                    lock_reason
+                FROM plan_operations
+                WHERE plan_version_id = :active_plan_version_id
+                """
+            ),
+            {
+                "draft_plan_version_id": draft_version.id,
+                "active_plan_version_id": active_plan_version_id,
+            },
+        )
+
+        db.commit()
+        db.refresh(draft_version)
+
+        return {
+            "status": "ok",
+            "plan_version": serialize_plan_version(draft_version),
+            "copied_operations": copied_rows.rowcount,
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось создать копию активного плана: {error}",
+        )
+    finally:
+        db.close()
+
+
+@app.get("/plan_versions/{plan_version_id}/diff")
+def get_plan_version_diff(plan_version_id: int):
+    db = SessionLocal()
+    try:
+        draft_version = (
+            db.query(PlanVersion)
+            .filter(PlanVersion.id == plan_version_id)
+            .first()
+        )
+        if not draft_version:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Версия плана {plan_version_id} не найдена",
+            )
+
+        if draft_version.status != "draft":
+            raise HTTPException(
+                status_code=409,
+                detail="Сравнение доступно только для черновой версии плана",
+            )
+
+        active_plan_version_id = get_active_plan_version_id(db)
+        active_version = (
+            db.query(PlanVersion)
+            .filter(PlanVersion.id == active_plan_version_id)
+            .first()
+        )
+        if not active_version:
+            raise HTTPException(
+                status_code=404,
+                detail="Активная версия плана не найдена",
+            )
+
+        rows = db.execute(
+            text(
+                """
+                SELECT
+                    draft_po.operation_id,
+                    oi.order_id,
+                    oi.id AS order_item_id,
+                    o.order_no,
+                    oi.product_id,
+                    oi.due_date AS order_item_due_time,
+                    o.due_date AS order_due_time,
+                    p.name AS product_name,
+                    oo.operation_type,
+                    ro.operation_name,
+                    oo.sequence_no,
+                    active_po.machine_id AS active_machine,
+                    draft_po.machine_id AS draft_machine,
+                    coalesce(active_machine.name, active_po.machine_id)
+                        AS active_machine_name,
+                    coalesce(draft_machine.name, draft_po.machine_id)
+                        AS draft_machine_name,
+                    active_machine.group_id AS active_machine_group_id,
+                    draft_machine.group_id AS draft_machine_group_id,
+                    active_po.start_time AS active_start,
+                    draft_po.start_time AS draft_start,
+                    active_po.end_time AS active_end,
+                    draft_po.end_time AS draft_end,
+                    coalesce(active_rate.setup_minutes, 0) AS active_setup_minutes,
+                    coalesce(draft_rate.setup_minutes, 0) AS draft_setup_minutes,
+                    active_po.machine_id IS DISTINCT FROM draft_po.machine_id
+                        AS machine_changed,
+                    active_po.start_time IS DISTINCT FROM draft_po.start_time
+                        AS start_changed,
+                    active_po.end_time IS DISTINCT FROM draft_po.end_time
+                        AS end_changed
+                FROM plan_operations active_po
+                JOIN plan_operations draft_po
+                  ON draft_po.operation_id = active_po.operation_id
+                JOIN order_operations oo
+                  ON oo.id = draft_po.operation_id
+                JOIN order_items oi
+                  ON oi.id = oo.order_item_id
+                LEFT JOIN orders o
+                  ON o.id = oi.order_id
+                LEFT JOIN products p
+                  ON p.id = oi.product_id
+                LEFT JOIN routing_operations ro
+                  ON ro.id = oo.routing_operation_id
+                LEFT JOIN machines active_machine
+                  ON active_machine.id = active_po.machine_id
+                LEFT JOIN machines draft_machine
+                  ON draft_machine.id = draft_po.machine_id
+                LEFT JOIN machine_product_rates active_rate
+                  ON active_rate.product_id = oi.product_id
+                 AND active_rate.machine_id = active_po.machine_id
+                 AND active_rate.operation_type = oo.operation_type
+                LEFT JOIN machine_product_rates draft_rate
+                  ON draft_rate.product_id = oi.product_id
+                 AND draft_rate.machine_id = draft_po.machine_id
+                 AND draft_rate.operation_type = oo.operation_type
+                WHERE active_po.plan_version_id = :active_plan_version_id
+                  AND draft_po.plan_version_id = :draft_plan_version_id
+                ORDER BY o.id, oi.id, oo.sequence_no, oo.id
+                """
+            ),
+            {
+                "active_plan_version_id": active_plan_version_id,
+                "draft_plan_version_id": plan_version_id,
+            },
+        ).mappings().all()
+
+        def to_int(value, default=0):
+            return int(value) if value is not None else default
+
+        all_operations = []
+        items = []
+        orders = {}
+        machines = {}
+
+        for row in rows:
+            active_start = to_int(row["active_start"])
+            draft_start = to_int(row["draft_start"])
+            active_end = to_int(row["active_end"])
+            draft_end = to_int(row["draft_end"])
+            active_setup = to_int(row["active_setup_minutes"])
+            draft_setup = to_int(row["draft_setup_minutes"])
+            start_delta = draft_start - active_start
+            end_delta = draft_end - active_end
+            duration_active = active_end - active_start
+            duration_draft = draft_end - draft_start
+            duration_delta = duration_draft - duration_active
+            machine_changed = bool(row["machine_changed"])
+            start_changed = bool(row["start_changed"])
+            end_changed = bool(row["end_changed"])
+            is_changed = machine_changed or start_changed or end_changed
+            order_id = row["order_id"]
+            due_time = (
+                row["order_item_due_time"]
+                if row["order_item_due_time"] is not None
+                else row["order_due_time"]
+            )
+
+            operation_data = {
+                "operation_id": row["operation_id"],
+                "order_id": order_id,
+                "order_item_id": row["order_item_id"],
+                "order_no": row["order_no"],
+                "product_id": row["product_id"],
+                "product_name": row["product_name"],
+                "operation_type": row["operation_type"],
+                "operation_name": row["operation_name"],
+                "sequence_no": row["sequence_no"],
+                "active_machine": row["active_machine"],
+                "draft_machine": row["draft_machine"],
+                "active_start": active_start,
+                "draft_start": draft_start,
+                "active_end": active_end,
+                "draft_end": draft_end,
+                "machine_changed": machine_changed,
+                "start_changed": start_changed,
+                "end_changed": end_changed,
+                "start_delta": start_delta,
+                "end_delta": end_delta,
+                "duration_active": duration_active,
+                "duration_draft": duration_draft,
+                "duration_delta": duration_delta,
+                "finish_later": end_delta > 0,
+                "finish_earlier": end_delta < 0,
+            }
+            all_operations.append(operation_data)
+            if is_changed:
+                items.append(operation_data)
+
+            order_data = orders.setdefault(
+                order_id,
+                {
+                    "order_id": order_id,
+                    "order_no": row["order_no"],
+                    "product_id": row["product_id"],
+                    "product_name": row["product_name"],
+                    "due_time": to_int(due_time) if due_time is not None else None,
+                    "active_finish": 0,
+                    "draft_finish": 0,
+                    "changed_operations": 0,
+                    "machine_changed": 0,
+                },
+            )
+            order_data["active_finish"] = max(order_data["active_finish"], active_end)
+            order_data["draft_finish"] = max(order_data["draft_finish"], draft_end)
+            if is_changed:
+                order_data["changed_operations"] += 1
+            if machine_changed:
+                order_data["machine_changed"] += 1
+
+            for prefix in ("active", "draft"):
+                machine_id = row[f"{prefix}_machine"]
+                if not machine_id:
+                    continue
+                machine_data = machines.setdefault(
+                    machine_id,
+                    {
+                        "machine_id": machine_id,
+                        "machine_name": row[f"{prefix}_machine_name"],
+                        "machine_group_id": row[f"{prefix}_machine_group_id"],
+                        "active_finish": 0,
+                        "draft_finish": 0,
+                        "active_busy_minutes": 0,
+                        "draft_busy_minutes": 0,
+                        "active_setup_minutes": 0,
+                        "draft_setup_minutes": 0,
+                        "changed_operations": 0,
+                    },
+                )
+                if prefix == "active":
+                    machine_data["active_finish"] = max(
+                        machine_data["active_finish"], active_end
+                    )
+                    machine_data["active_busy_minutes"] += duration_active
+                    machine_data["active_setup_minutes"] += active_setup
+                else:
+                    machine_data["draft_finish"] = max(
+                        machine_data["draft_finish"], draft_end
+                    )
+                    machine_data["draft_busy_minutes"] += duration_draft
+                    machine_data["draft_setup_minutes"] += draft_setup
+
+            if is_changed:
+                affected_machine_ids = {
+                    row["active_machine"],
+                    row["draft_machine"],
+                }
+                for machine_id in affected_machine_ids:
+                    if machine_id in machines:
+                        machines[machine_id]["changed_operations"] += 1
+
+        plan_finish_active = max(
+            (operation["active_end"] for operation in all_operations),
+            default=0,
+        )
+        plan_finish_draft = max(
+            (operation["draft_end"] for operation in all_operations),
+            default=0,
+        )
+
+        order_impacts = []
+        late_orders_active = 0
+        late_orders_draft = 0
+        total_lateness_active = 0
+        total_lateness_draft = 0
+        for order_data in orders.values():
+            due_time = order_data["due_time"]
+            active_lateness = (
+                max(order_data["active_finish"] - due_time, 0)
+                if due_time is not None
+                else 0
+            )
+            draft_lateness = (
+                max(order_data["draft_finish"] - due_time, 0)
+                if due_time is not None
+                else 0
+            )
+            total_lateness_active += active_lateness
+            total_lateness_draft += draft_lateness
+            if active_lateness > 0:
+                late_orders_active += 1
+            if draft_lateness > 0:
+                late_orders_draft += 1
+
+            finish_delta = order_data["draft_finish"] - order_data["active_finish"]
+            if finish_delta != 0 or order_data["changed_operations"] > 0:
+                order_impacts.append(
+                    {
+                        "order_id": order_data["order_id"],
+                        "order_no": order_data["order_no"],
+                        "product_id": order_data["product_id"],
+                        "product_name": order_data["product_name"],
+                        "active_finish": order_data["active_finish"],
+                        "draft_finish": order_data["draft_finish"],
+                        "finish_delta": finish_delta,
+                        "due_time": due_time,
+                        "active_lateness": active_lateness,
+                        "draft_lateness": draft_lateness,
+                        "lateness_delta": draft_lateness - active_lateness,
+                        "changed_operations": order_data["changed_operations"],
+                        "machine_changed": order_data["machine_changed"],
+                    }
+                )
+
+        order_impacts.sort(
+            key=lambda item: (-item["finish_delta"], str(item["order_no"] or ""))
+        )
+
+        machine_impacts = []
+        for machine_data in machines.values():
+            machine_data["finish_delta"] = (
+                machine_data["draft_finish"] - machine_data["active_finish"]
+            )
+            machine_data["busy_delta"] = (
+                machine_data["draft_busy_minutes"]
+                - machine_data["active_busy_minutes"]
+            )
+            machine_data["setup_delta"] = (
+                machine_data["draft_setup_minutes"]
+                - machine_data["active_setup_minutes"]
+            )
+            machine_data["active_run_minutes"] = max(
+                machine_data["active_busy_minutes"]
+                - machine_data["active_setup_minutes"],
+                0,
+            )
+            machine_data["draft_run_minutes"] = max(
+                machine_data["draft_busy_minutes"]
+                - machine_data["draft_setup_minutes"],
+                0,
+            )
+            machine_data["run_delta"] = (
+                machine_data["draft_run_minutes"]
+                - machine_data["active_run_minutes"]
+            )
+            if (
+                machine_data["finish_delta"] != 0
+                or machine_data["busy_delta"] != 0
+                or machine_data["changed_operations"] > 0
+            ):
+                machine_impacts.append(machine_data)
+
+        machine_impacts.sort(
+            key=lambda item: (-abs(item["finish_delta"]), str(item["machine_id"]))
+        )
+
+        end_deltas = [operation["end_delta"] for operation in all_operations]
+        operations_finished_later = sum(1 for delta in end_deltas if delta > 0)
+        operations_finished_earlier = sum(1 for delta in end_deltas if delta < 0)
+        operations_unchanged_finish = sum(1 for delta in end_deltas if delta == 0)
+        delays = [delta for delta in end_deltas if delta > 0]
+        gains = [delta for delta in end_deltas if delta < 0]
+
+        return {
+            "active_plan_version": serialize_plan_version(active_version),
+            "draft_plan_version": serialize_plan_version(draft_version),
+            "summary": {
+                "total_operations": len(all_operations),
+                "changed_operations": len(items),
+                "affected_orders": len(
+                    {item["order_id"] for item in items if item["order_id"] is not None}
+                ),
+                "affected_order_items": len(
+                    {
+                        item["order_item_id"]
+                        for item in items
+                        if item["order_item_id"] is not None
+                    }
+                ),
+                "machine_changed": sum(1 for item in items if item["machine_changed"]),
+                "start_changed": sum(1 for item in items if item["start_changed"]),
+                "end_changed": sum(1 for item in items if item["end_changed"]),
+                "operations_finished_later": operations_finished_later,
+                "operations_finished_earlier": operations_finished_earlier,
+                "operations_unchanged_finish": operations_unchanged_finish,
+                "max_operation_delay": max(delays, default=0),
+                "max_operation_gain": min(gains, default=0),
+                "plan_finish_active": plan_finish_active,
+                "plan_finish_draft": plan_finish_draft,
+                "plan_finish_delta": plan_finish_draft - plan_finish_active,
+                "late_orders_active": late_orders_active,
+                "late_orders_draft": late_orders_draft,
+                "late_orders_delta": late_orders_draft - late_orders_active,
+                "total_lateness_active": total_lateness_active,
+                "total_lateness_draft": total_lateness_draft,
+                "total_lateness_delta": (
+                    total_lateness_draft - total_lateness_active
+                ),
+            },
+            "order_impacts": order_impacts,
+            "machine_impacts": machine_impacts,
+            "items": items,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось сравнить версии плана: {error}",
+        )
     finally:
         db.close()
 
@@ -263,10 +738,10 @@ async def update_freeze_horizon(
 # GET OPERATIONS
 # ======================
 @app.get("/operations")
-def get_operations():
+def get_operations(plan_version_id: Optional[int] = None):
     db = SessionLocal()
     try:
-        active_plan_version_id = get_active_plan_version_id(db)
+        requested_plan_version_id = get_requested_plan_version_id(db, plan_version_id)
         rows = db.execute(
             text(
                 """
@@ -327,7 +802,7 @@ def get_operations():
                 ORDER BY po.start_time, po.operation_id
                 """
             ),
-            {"plan_version_id": active_plan_version_id},
+            {"plan_version_id": requested_plan_version_id},
         ).mappings().all()
 
         return [
@@ -361,14 +836,64 @@ def get_operations():
         db.close()
 
 
+@app.get("/machines")
+def get_machines():
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT
+                    id,
+                    group_id,
+                    name,
+                    status
+                FROM machines
+                WHERE status = 'active'
+                ORDER BY group_id, id
+                """
+            )
+        ).mappings().all()
+
+        return [
+            {
+                "id": row["id"],
+                "group_id": row["group_id"],
+                "name": row["name"],
+                "status": row["status"],
+            }
+            for row in rows
+        ]
+    finally:
+        db.close()
+
+
 # ======================
 # UPDATE FROM GANTT (DRAG)
 # ======================
 @app.post("/update_op/{op_id}")
-async def update_operation(op_id: int, payload: OperationUpdatePayload):
+async def update_operation(
+    op_id: int,
+    payload: OperationUpdatePayload,
+    plan_version_id: Optional[int] = None,
+):
     db = SessionLocal()
     try:
-        active_plan_version_id = get_active_plan_version_id(db)
+        if plan_version_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Для изменения операции нужно явно указать версию плана",
+            )
+
+        requested_plan_version_id = get_requested_plan_version_id(db, plan_version_id)
+        plan_version = get_plan_version_or_404(db, requested_plan_version_id)
+
+        if plan_version.status != "draft":
+            raise HTTPException(
+                status_code=409,
+                detail="Редактировать можно только черновую версию плана",
+            )
+
         start = int(payload.start)
         machine_raw = payload.machine
 
@@ -397,7 +922,7 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
         op = (
             db.query(PlanOperation)
             .filter(PlanOperation.operation_id == op_id)
-            .filter(PlanOperation.plan_version_id == active_plan_version_id)
+            .filter(PlanOperation.plan_version_id == requested_plan_version_id)
             .first()
         )
 
@@ -576,7 +1101,7 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
             {
                 "order_item_id": operation_context["order_item_id"],
                 "sequence_no": operation_context["sequence_no"],
-                "plan_version_id": active_plan_version_id,
+                "plan_version_id": requested_plan_version_id,
             },
         ).mappings().first()
 
@@ -606,7 +1131,7 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
 
         change = PlanChangeLog(
             change_set_id=change_set_id,
-            plan_version_id=active_plan_version_id,
+            plan_version_id=requested_plan_version_id,
             operation_id=op.operation_id,
             old_machine_id=old_machine_id,
             new_machine_id=machine_value,
@@ -626,7 +1151,7 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
                 changed_operation_id=op.operation_id,
                 freeze_horizon_minutes=freeze_horizon_minutes,
                 change_set_id=change_set_id,
-                active_plan_version_id=active_plan_version_id,
+                plan_version_id=requested_plan_version_id,
             )
         except RepairSchedulerError as error:
             db.rollback()
@@ -701,7 +1226,7 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
             "type": "operation_update",
             "data": {
                 "id": op.operation_id,
-                "plan_version_id": active_plan_version_id,
+                "plan_version_id": requested_plan_version_id,
                 "label": (
                     (
                         f"{operation_meta['order_no']} {operation_meta['product_name']}"
@@ -766,216 +1291,35 @@ async def update_operation(op_id: int, payload: OperationUpdatePayload):
     finally:
         db.close()
 
-
-# ======================
-# ROLLBACK LAST CHANGE
-# ======================
-@app.post("/rollback_last_change")
-async def rollback_last_change():
-    print("↩️ ROLLBACK ENDPOINT CALLED")
-
-    db = SessionLocal()
-    try:
-        active_plan_version_id = get_active_plan_version_id(db)
-        last_change = (
-            db.query(PlanChangeLog)
-            .filter(
-                (PlanChangeLog.is_rolled_back == False)
-                | (PlanChangeLog.is_rolled_back.is_(None))
-            )
-            .filter(PlanChangeLog.change_reason == "manual_gantt_drag")
-            .filter(PlanChangeLog.plan_version_id == active_plan_version_id)
-            .order_by(PlanChangeLog.id.desc())
-            .first()
-        )
-
-        if not last_change:
-            print("❌ NO AVAILABLE CHANGES FOR ROLLBACK")
-            raise HTTPException(
-                status_code=404,
-                detail="Нет доступных изменений для отката",
-            )
-
-        op = (
-            db.query(PlanOperation)
-            .filter(PlanOperation.operation_id == last_change.operation_id)
-            .filter(PlanOperation.plan_version_id == active_plan_version_id)
-            .first()
-        )
-
-        if not op:
-            print("❌ OPERATION NOT FOUND:", last_change.operation_id)
-            raise HTTPException(
-                status_code=404,
-                detail=f"Операция {last_change.operation_id} не найдена",
-            )
-
-        current_machine_id = op.machine_id
-        current_start_time = int(op.start_time) if op.start_time is not None else 0
-        current_end_time = int(op.end_time) if op.end_time is not None else 0
-
-        op.machine_id = last_change.old_machine_id
-        op.start_time = int(last_change.old_start_time)
-        op.end_time = int(last_change.old_end_time)
-
-        last_change.is_rolled_back = True
-        last_change.rollback_reason = "manual_rollback"
-
-        db.execute(
-            text("UPDATE plan_change_log SET rollback_at = now() WHERE id = :id"),
-            {"id": last_change.id},
-        )
-
-        rollback_log = PlanChangeLog(
-            plan_version_id=active_plan_version_id,
-            operation_id=last_change.operation_id,
-            old_machine_id=current_machine_id,
-            new_machine_id=last_change.old_machine_id,
-            old_start_time=current_start_time,
-            old_end_time=current_end_time,
-            new_start_time=int(last_change.old_start_time),
-            new_end_time=int(last_change.old_end_time),
-            change_reason="manual_rollback",
-            is_rolled_back=True,
-            rollback_reason="rollback_event_record",
-        )
-
-        db.add(rollback_log)
-
-        db.commit()
-        db.refresh(op)
-        db.refresh(last_change)
-        db.refresh(rollback_log)
-
-        operation_meta = db.execute(
-            text(
-                """
-                WITH item_numbers AS (
-                    SELECT
-                        oi.id AS order_item_id,
-                        oi.order_id,
-                        row_number() OVER (
-                            PARTITION BY oi.order_id
-                            ORDER BY oi.priority, oi.id
-                        ) AS item_no
-                    FROM order_items oi
-                ),
-                operation_numbers AS (
-                    SELECT
-                        oo.id AS operation_id,
-                        item_numbers.order_id,
-                        o.order_no,
-                        item_numbers.item_no,
-                        p.name AS product_name,
-                        row_number() OVER (
-                            PARTITION BY oi.id
-                            ORDER BY oo.sequence_no, oo.id
-                    ) AS operation_no
-                    FROM order_operations oo
-                    JOIN order_items oi ON oi.id = oo.order_item_id
-                    LEFT JOIN orders o ON o.id = oi.order_id
-                    JOIN products p ON p.id = oi.product_id
-                    JOIN item_numbers ON item_numbers.order_item_id = oi.id
-                )
-                SELECT
-                    coalesce(m.name, :machine_id) AS machine_name,
-                    m.group_id AS machine_group_id,
-                    oo.operation_type,
-                    ro.operation_name,
-                    onum.order_id,
-                    onum.order_no,
-                    onum.item_no,
-                    onum.product_name,
-                    onum.operation_no,
-                    coalesce(mpr.setup_minutes, 0) AS setup_minutes
-                FROM order_operations oo
-                JOIN order_items oi ON oi.id = oo.order_item_id
-                LEFT JOIN routing_operations ro ON ro.id = oo.routing_operation_id
-                LEFT JOIN machines m ON m.id = :machine_id
-                LEFT JOIN operation_numbers onum ON onum.operation_id = oo.id
-                LEFT JOIN machine_product_rates mpr
-                  ON mpr.product_id = oi.product_id
-                 AND mpr.machine_id = :machine_id
-                 AND mpr.operation_type = oo.operation_type
-                WHERE oo.id = :operation_id
-                """
-            ),
-            {
-                "operation_id": op.operation_id,
-                "machine_id": op.machine_id,
-            },
-        ).mappings().first()
-
-        event = {
-            "type": "operation_update",
-            "data": {
-                "id": op.operation_id,
-                "plan_version_id": active_plan_version_id,
-                "label": (
-                    (
-                        f"{operation_meta['order_no']} {operation_meta['product_name']}"
-                        if operation_meta["order_no"]
-                        else f"{int(operation_meta['order_id']):03d} {operation_meta['product_name']}"
-                    )
-                    if operation_meta
-                    and operation_meta["order_id"] is not None
-                    and operation_meta["product_name"] is not None
-                    else str(op.operation_id)
-                ),
-                "order_id": (
-                    operation_meta["order_id"] if operation_meta else None
-                ),
-                "machine": op.machine_id,
-                "machine_name": (
-                    operation_meta["machine_name"] if operation_meta else op.machine_id
-                ),
-                "machine_group_id": (
-                    operation_meta["machine_group_id"] if operation_meta else None
-                ),
-                "operation_type": (
-                    operation_meta["operation_type"] if operation_meta else None
-                ),
-                "operation_name": (
-                    operation_meta["operation_name"] if operation_meta else None
-                ),
-                "product_name": (
-                    operation_meta["product_name"] if operation_meta else None
-                ),
-                "setup_minutes": (
-                    int(operation_meta["setup_minutes"] or 0)
-                    if operation_meta
-                    else 0
-                ),
-                "start": int(op.start_time) if op.start_time is not None else 0,
-                "end": int(op.end_time) if op.end_time is not None else 0,
-            },
-        }
-
-        broadcast_sync(event)
-
-        return {
-            "status": "ok",
-            "rolled_back_change_id": last_change.id,
-            "rollback_log_id": rollback_log.id,
-            "operation": event["data"],
-        }
-
-    finally:
-        db.close()
-
-
 # ======================
 # GET PLAN CHANGE LOG
 # ======================
 @app.post("/plan_change_log/change_set/{change_set_id}/rollback")
-async def rollback_change_set(change_set_id: str):
+async def rollback_change_set(
+    change_set_id: str,
+    plan_version_id: Optional[int] = None,
+):
     db = SessionLocal()
     try:
-        active_plan_version_id = get_active_plan_version_id(db)
+        if plan_version_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Для отката группы изменений нужно явно указать версию плана",
+            )
+
+        requested_plan_version_id = get_requested_plan_version_id(db, plan_version_id)
+        plan_version = get_plan_version_or_404(db, requested_plan_version_id)
+
+        if plan_version.status != "draft":
+            raise HTTPException(
+                status_code=409,
+                detail="Откат группы изменений можно выполнять только в черновой версии плана",
+            )
+
         rows = (
             db.query(PlanChangeLog)
             .filter(PlanChangeLog.change_set_id == change_set_id)
-            .filter(PlanChangeLog.plan_version_id == active_plan_version_id)
+            .filter(PlanChangeLog.plan_version_id == requested_plan_version_id)
             .order_by(PlanChangeLog.id.desc())
             .all()
         )
@@ -1003,7 +1347,7 @@ async def rollback_change_set(change_set_id: str):
             op = (
                 db.query(PlanOperation)
                 .filter(PlanOperation.operation_id == row.operation_id)
-                .filter(PlanOperation.plan_version_id == active_plan_version_id)
+                .filter(PlanOperation.plan_version_id == requested_plan_version_id)
                 .first()
             )
 
@@ -1031,7 +1375,7 @@ async def rollback_change_set(change_set_id: str):
 
             rollback_log = PlanChangeLog(
                 change_set_id=rollback_change_set_id,
-                plan_version_id=active_plan_version_id,
+                plan_version_id=requested_plan_version_id,
                 operation_id=row.operation_id,
                 old_machine_id=current_machine_id,
                 new_machine_id=row.old_machine_id,
@@ -1047,7 +1391,7 @@ async def rollback_change_set(change_set_id: str):
 
             updated_by_operation_id[op.operation_id] = {
                 "id": op.operation_id,
-                "plan_version_id": active_plan_version_id,
+                "plan_version_id": requested_plan_version_id,
                 "machine": op.machine_id,
                 "start": int(op.start_time),
                 "end": int(op.end_time),
@@ -1089,49 +1433,109 @@ def get_plan_change_log(
     machine: Optional[str] = None,
     change_reason: Optional[str] = None,
     rolled_back: Optional[bool] = None,
+    plan_version_id: Optional[int] = None,
 ):
     db = SessionLocal()
     try:
-        active_plan_version_id = get_active_plan_version_id(db)
-        query = db.query(PlanChangeLog).filter(
-            PlanChangeLog.plan_version_id == active_plan_version_id
-        )
-
+        requested_plan_version_id = get_requested_plan_version_id(db, plan_version_id)
+        conditions = ["pcl.plan_version_id = :plan_version_id"]
+        params = {
+            "plan_version_id": requested_plan_version_id,
+            "limit": limit,
+        }
         if operation_id is not None:
-            query = query.filter(PlanChangeLog.operation_id == operation_id)
+            conditions.append("pcl.operation_id = :operation_id")
+            params["operation_id"] = operation_id
 
         if machine:
             machine_clean = machine.strip()
-            query = query.filter(
-                (PlanChangeLog.old_machine_id == machine_clean)
-                | (PlanChangeLog.new_machine_id == machine_clean)
+            conditions.append(
+                "(pcl.old_machine_id = :machine OR pcl.new_machine_id = :machine)"
             )
+            params["machine"] = machine_clean
 
         if change_reason:
-            query = query.filter(PlanChangeLog.change_reason == change_reason)
+            conditions.append("pcl.change_reason = :change_reason")
+            params["change_reason"] = change_reason
 
         if rolled_back is not None:
-            query = query.filter(PlanChangeLog.is_rolled_back == rolled_back)
+            conditions.append("coalesce(pcl.is_rolled_back, false) = :rolled_back")
+            params["rolled_back"] = rolled_back
 
-        rows = query.order_by(PlanChangeLog.id.desc()).limit(limit).all()
+        where_sql = " AND ".join(conditions)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    pcl.id,
+                    pcl.change_set_id,
+                    pcl.plan_version_id,
+                    pcl.operation_id,
+                    pcl.old_machine_id,
+                    pcl.new_machine_id,
+                    pcl.old_start_time,
+                    pcl.old_end_time,
+                    pcl.new_start_time,
+                    pcl.new_end_time,
+                    pcl.change_reason,
+                    pcl.created_at,
+                    coalesce(pcl.is_rolled_back, false) AS is_rolled_back,
+                    pcl.rollback_at,
+                    pcl.rollback_reason,
+                    oi.order_id,
+                    o.order_no,
+                    oi.product_id,
+                    p.name AS product_name,
+                    oo.operation_type,
+                    ro.operation_name,
+                    oo.sequence_no
+                FROM plan_change_log pcl
+                LEFT JOIN order_operations oo ON oo.id = pcl.operation_id
+                LEFT JOIN order_items oi ON oi.id = oo.order_item_id
+                LEFT JOIN orders o ON o.id = oi.order_id
+                LEFT JOIN products p ON p.id = oi.product_id
+                LEFT JOIN routing_operations ro ON ro.id = oo.routing_operation_id
+                WHERE {where_sql}
+                ORDER BY pcl.id DESC
+                LIMIT :limit
+                """
+            ),
+            params,
+        ).mappings().all()
 
         return [
             {
-                "id": row.id,
-                "change_set_id": row.change_set_id,
-                "plan_version_id": row.plan_version_id,
-                "operation_id": row.operation_id,
-                "old_machine_id": row.old_machine_id,
-                "new_machine_id": row.new_machine_id,
-                "old_start_time": row.old_start_time,
-                "old_end_time": row.old_end_time,
-                "new_start_time": row.new_start_time,
-                "new_end_time": row.new_end_time,
-                "change_reason": row.change_reason,
-                "created_at": row.created_at.isoformat() if row.created_at else None,
-                "is_rolled_back": bool(row.is_rolled_back),
-                "rollback_at": row.rollback_at.isoformat() if row.rollback_at else None,
-                "rollback_reason": row.rollback_reason,
+                "id": row["id"],
+                "change_set_id": row["change_set_id"],
+                "plan_version_id": row["plan_version_id"],
+                "operation_id": row["operation_id"],
+                "order_id": row["order_id"],
+                "order_no": row["order_no"],
+                "product_id": row["product_id"],
+                "product_name": row["product_name"],
+                "operation_type": row["operation_type"],
+                "operation_name": row["operation_name"],
+                "sequence_no": row["sequence_no"],
+                "operation_label": (
+                    f"{row['order_no']} — {row['product_name']} — "
+                    f"{row['sequence_no']} {row['operation_name']}"
+                    if row["order_no"]
+                    and row["product_name"]
+                    and row["sequence_no"] is not None
+                    and row["operation_name"]
+                    else str(row["operation_id"])
+                ),
+                "old_machine_id": row["old_machine_id"],
+                "new_machine_id": row["new_machine_id"],
+                "old_start_time": row["old_start_time"],
+                "old_end_time": row["old_end_time"],
+                "new_start_time": row["new_start_time"],
+                "new_end_time": row["new_end_time"],
+                "change_reason": row["change_reason"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "is_rolled_back": bool(row["is_rolled_back"]),
+                "rollback_at": row["rollback_at"].isoformat() if row["rollback_at"] else None,
+                "rollback_reason": row["rollback_reason"],
             }
             for row in rows
         ]
