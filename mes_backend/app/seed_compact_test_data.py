@@ -18,6 +18,16 @@ ROUTE_GAP_MINUTES = 30
 MACHINE_GAP_MINUTES = 15
 COILING_SETUP_RESOURCE_KEY = "COILING"
 
+SETUP_TEAM_BY_MACHINE_GROUP = {
+    "COIL_A": "SETUP_COIL",
+    "COIL_B": "SETUP_COIL",
+    "BEND": "SETUP_BEND",
+    "FACE": "SETUP_FACE",
+    "HEAT": "SETUP_HEAT",
+    "COAT_A": "SETUP_COAT",
+    "COAT_B": "SETUP_COAT",
+}
+
 SETUP_MINUTES = {
     "COILING": 90,
     "FACING": 60,
@@ -80,7 +90,7 @@ ORDERS = [
         "id": 1,
         "order_no": "ORD-001",
         "product_key": "SPR-01-01",
-        "quantity": 1200,
+        "quantity": 2000,
         "due_time": 7200,
         "routing_id": 101,
         "route": ["COILING", "FACING", "HEAT", "COATING"],
@@ -95,7 +105,7 @@ ORDERS = [
         "id": 2,
         "order_no": "ORD-002",
         "product_key": "SPR-02-01",
-        "quantity": 1600,
+        "quantity": 2100,
         "due_time": 8400,
         "routing_id": 102,
         "route": ["COILING", "FACING", "HEAT", "COATING"],
@@ -110,7 +120,7 @@ ORDERS = [
         "id": 3,
         "order_no": "ORD-003",
         "product_key": "SPR-01-02",
-        "quantity": 2000,
+        "quantity": 2200,
         "due_time": 9600,
         "routing_id": 103,
         "route": ["COILING", "HEAT", "COATING"],
@@ -124,7 +134,7 @@ ORDERS = [
         "id": 4,
         "order_no": "ORD-004",
         "product_key": "SPR-02-02",
-        "quantity": 2400,
+        "quantity": 2300,
         "due_time": 10800,
         "routing_id": 104,
         "route": ["COILING", "HEAT", "COATING"],
@@ -138,7 +148,7 @@ ORDERS = [
         "id": 5,
         "order_no": "ORD-005",
         "product_key": "SPR-01-03",
-        "quantity": 1800,
+        "quantity": 2200,
         "due_time": 12000,
         "routing_id": 105,
         "route": ["COILING", "BENDING", "HEAT", "COATING"],
@@ -153,7 +163,7 @@ ORDERS = [
         "id": 6,
         "order_no": "ORD-006",
         "product_key": "SPR-02-03",
-        "quantity": 2200,
+        "quantity": 2300,
         "due_time": 13200,
         "routing_id": 106,
         "route": ["COILING", "BENDING", "HEAT", "COATING"],
@@ -570,11 +580,117 @@ def get_rate(connection, product_id, operation_type, machine_id):
     return units_per_minute, int(rate["setup_minutes"] or 0)
 
 
+def get_machine_group(connection, machine_id):
+    machine_group_id = connection.execute(
+        text("SELECT group_id FROM machines WHERE id = :machine_id"),
+        {"machine_id": machine_id},
+    ).scalar()
+
+    if not machine_group_id:
+        raise RuntimeError(f"Не найдена группа оборудования для станка {machine_id}")
+
+    return machine_group_id
+
+
+def build_work_intervals(days: int):
+    intervals = []
+
+    for day in range(days):
+        day_offset = day * 1440
+        intervals.extend(
+            [
+                (day_offset + 20, day_offset + 240),
+                (day_offset + 270, day_offset + 460),
+                (day_offset + 500, day_offset + 720),
+                (day_offset + 750, day_offset + 940),
+            ]
+        )
+
+    return intervals
+
+
+def overlaps(start_a, end_a, start_b, end_b):
+    return start_a < end_b and start_b < end_a
+
+
+def has_overlap(intervals, start, end, gap_after=0):
+    return any(
+        overlaps(start, end, busy_start, busy_end + gap_after)
+        for busy_start, busy_end in intervals
+    )
+
+
+def find_conflict_end(intervals, start, end, gap_after=0):
+    conflicting_ends = [
+        busy_end + gap_after
+        for busy_start, busy_end in intervals
+        if overlaps(start, end, busy_start, busy_end + gap_after)
+    ]
+
+    return max(conflicting_ends) if conflicting_ends else None
+
+
+def find_earliest_start(
+    earliest_start,
+    duration,
+    setup_minutes,
+    machine_id,
+    setup_team_id,
+    work_intervals,
+    machine_busy,
+    setup_team_busy,
+):
+    for work_start, work_end in work_intervals:
+        candidate_start = max(earliest_start, work_start)
+
+        while True:
+            candidate_end = candidate_start + duration
+
+            if candidate_end > work_end:
+                break
+
+            machine_conflict_end = find_conflict_end(
+                machine_busy.get(machine_id, []),
+                candidate_start,
+                candidate_end,
+                MACHINE_GAP_MINUTES,
+            )
+            if machine_conflict_end is not None:
+                candidate_start = machine_conflict_end
+                if candidate_start + duration > work_end:
+                    break
+                continue
+
+            if setup_minutes > 0 and setup_team_id:
+                setup_conflict_end = find_conflict_end(
+                    setup_team_busy.get(setup_team_id, []),
+                    candidate_start,
+                    candidate_start + setup_minutes,
+                    MACHINE_GAP_MINUTES,
+                )
+                if setup_conflict_end is not None:
+                    candidate_start = setup_conflict_end
+                    if candidate_start + duration > work_end:
+                        break
+                    continue
+
+            return candidate_start
+
+    raise RuntimeError(
+        "Не удалось найти рабочий интервал для операции "
+        f"machine_id={machine_id}, earliest_start={earliest_start}, duration={duration}"
+    )
+
+
 def create_plan_operations(connection, columns, products, order_operation_by_key):
     plan_columns = columns["plan_operations"]
     order_item_ready_time = {}
-    machine_last_operation = {}
-    coiling_setup_resource_ready_time = 0
+    machine_busy = {}
+    setup_team_busy = {}
+    work_intervals = build_work_intervals(days=10)
+    max_work_interval_duration = max(
+        work_end - work_start for work_start, work_end in work_intervals
+    )
 
     for order in ORDERS:
         product_id = products[order["product_key"]]["id"]
@@ -588,35 +704,33 @@ def create_plan_operations(connection, columns, products, order_operation_by_key
                 machine_id,
             )
             duration = ceil(order["quantity"] / units_per_minute) + setup_minutes
+            operation_id = order_operation_by_key[(order["id"], operation_type)]
+
+            if duration > max_work_interval_duration:
+                raise RuntimeError(
+                    f"Операция {operation_id} длительностью {duration} мин. "
+                    "не помещается ни в один рабочий интервал смены. "
+                    "Уменьшите количество или увеличьте норму."
+                )
+
             order_item_id = order["id"]
             route_ready = order_item_ready_time.get(order_item_id, 0)
-            previous_machine_operation = machine_last_operation.get(machine_id)
-            is_first_order_item_operation = operation_index == 0
-            is_coiling = operation_type == COILING_SETUP_RESOURCE_KEY
+            machine_group_id = get_machine_group(connection, machine_id)
+            setup_team_id = SETUP_TEAM_BY_MACHINE_GROUP.get(machine_group_id)
 
             if order_item_id in order_item_ready_time:
                 route_ready += ROUTE_GAP_MINUTES
 
-            if previous_machine_operation and is_first_order_item_operation:
-                machine_ready = (
-                    previous_machine_operation["start_time"]
-                    + previous_machine_operation["setup_minutes"]
-                    + MACHINE_GAP_MINUTES
-                )
-            elif previous_machine_operation:
-                machine_ready = (
-                    previous_machine_operation["end_time"] + MACHINE_GAP_MINUTES
-                )
-            else:
-                machine_ready = 0
-
-            setup_resource_ready = (
-                coiling_setup_resource_ready_time
-                if is_first_order_item_operation and is_coiling
-                else 0
+            start_time = find_earliest_start(
+                route_ready,
+                duration,
+                setup_minutes,
+                machine_id,
+                setup_team_id,
+                work_intervals,
+                machine_busy,
+                setup_team_busy,
             )
-
-            start_time = max(route_ready, machine_ready, setup_resource_ready)
             end_time = start_time + duration
 
             insert_row(
@@ -624,9 +738,7 @@ def create_plan_operations(connection, columns, products, order_operation_by_key
                 "plan_operations",
                 {
                     "plan_version_id": ACTIVE_PLAN_VERSION_ID,
-                    "operation_id": order_operation_by_key[
-                        (order["id"], operation_type)
-                    ],
+                    "operation_id": operation_id,
                     "machine_id": machine_id,
                     "start_time": start_time,
                     "end_time": end_time,
@@ -636,14 +748,10 @@ def create_plan_operations(connection, columns, products, order_operation_by_key
                 plan_columns,
             )
             order_item_ready_time[order_item_id] = end_time
-            machine_last_operation[machine_id] = {
-                "start_time": start_time,
-                "end_time": end_time,
-                "setup_minutes": setup_minutes,
-            }
-            if is_first_order_item_operation and is_coiling:
-                coiling_setup_resource_ready_time = (
-                    start_time + setup_minutes + MACHINE_GAP_MINUTES
+            machine_busy.setdefault(machine_id, []).append((start_time, end_time))
+            if setup_minutes > 0 and setup_team_id:
+                setup_team_busy.setdefault(setup_team_id, []).append(
+                    (start_time, start_time + setup_minutes)
                 )
 
 

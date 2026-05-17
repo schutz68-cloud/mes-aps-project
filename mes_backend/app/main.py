@@ -3,10 +3,22 @@ from pydantic import BaseModel
 from typing import Optional
 from uuid import uuid4
 from fastapi.middleware.cors import CORSMiddleware
+from app.calendar_utils import (
+    build_non_working_intervals,
+    build_work_intervals,
+    is_inside_work_interval,
+)
 from app.db import SessionLocal, init_db_schema
-from app.models import PlanOperation, PlanChangeLog, PlanVersion, SystemSetting
+from app.models import (
+    MesScheduleOperation,
+    MesScheduleRun,
+    PlanOperation,
+    PlanChangeLog,
+    PlanVersion,
+    SystemSetting,
+)
 from app.repair_scheduler import RepairSchedulerError, repair_plan_after_manual_move
-from app.websocket import connect, disconnect, broadcast_sync
+from app.websocket import connect, disconnect, broadcast, broadcast_sync
 from sqlalchemy import text
 from math import ceil
 
@@ -31,6 +43,18 @@ class OperationUpdatePayload(BaseModel):
 
 class FreezeHorizonPayload(BaseModel):
     minutes: int
+
+
+class PlanVersionUpdatePayload(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class MesScheduleRunCreatePayload(BaseModel):
+    period: Optional[str] = "tomorrow"
+    start_minute: Optional[int] = None
+    end_minute: Optional[int] = None
+    description: Optional[str] = None
 
 
 # ======================
@@ -127,6 +151,136 @@ def serialize_plan_version(plan_version):
     }
 
 
+def _row_value(row, key):
+    if isinstance(row, dict):
+        return row.get(key)
+
+    if hasattr(row, "_mapping"):
+        return row._mapping.get(key)
+
+    return getattr(row, key)
+
+
+def serialize_mes_schedule_run(run):
+    return {
+        "id": _row_value(run, "id"),
+        "source_plan_version_id": _row_value(run, "source_plan_version_id"),
+        "start_minute": _row_value(run, "start_minute"),
+        "end_minute": _row_value(run, "end_minute"),
+        "status": _row_value(run, "status"),
+        "created_at": (
+            _row_value(run, "created_at").isoformat()
+            if _row_value(run, "created_at")
+            else None
+        ),
+        "created_by": _row_value(run, "created_by"),
+        "released_at": (
+            _row_value(run, "released_at").isoformat()
+            if _row_value(run, "released_at")
+            else None
+        ),
+        "released_by": _row_value(run, "released_by"),
+        "cancelled_at": (
+            _row_value(run, "cancelled_at").isoformat()
+            if _row_value(run, "cancelled_at")
+            else None
+        ),
+        "cancelled_by": _row_value(run, "cancelled_by"),
+        "description": _row_value(run, "description"),
+        "is_hidden": bool(_row_value(run, "is_hidden")),
+    }
+
+
+def serialize_mes_schedule_operation(row):
+    return {
+        "id": _row_value(row, "id"),
+        "schedule_run_id": _row_value(row, "schedule_run_id"),
+        "source_plan_operation_id": _row_value(row, "source_plan_operation_id"),
+        "operation_id": _row_value(row, "operation_id"),
+        "order_id": _row_value(row, "order_id"),
+        "order_item_id": _row_value(row, "order_item_id"),
+        "product_id": _row_value(row, "product_id"),
+        "product_name": _row_value(row, "product_name"),
+        "order_no": _row_value(row, "order_no"),
+        "machine_id": _row_value(row, "machine_id"),
+        "machine_name": _row_value(row, "machine_name"),
+        "machine_group_id": _row_value(row, "machine_group_id"),
+        "operation_type": _row_value(row, "operation_type"),
+        "operation_name": _row_value(row, "operation_name"),
+        "quantity": _row_value(row, "quantity"),
+        "setup_minutes": _row_value(row, "setup_minutes"),
+        "planned_start_time": _row_value(row, "planned_start_time"),
+        "planned_end_time": _row_value(row, "planned_end_time"),
+        "status": _row_value(row, "status"),
+    }
+
+
+def resolve_mes_schedule_period(payload: MesScheduleRunCreatePayload):
+    period = payload.period or "tomorrow"
+
+    if period == "today":
+        start_minute = 0
+        end_minute = 1440
+        default_description = "Производственное задание на сегодня"
+    elif period == "tomorrow":
+        start_minute = 1440
+        end_minute = 2880
+        default_description = "Производственное задание на завтра"
+    elif period == "custom":
+        if payload.start_minute is None or payload.end_minute is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Для произвольного периода нужно указать начало и конец",
+            )
+
+        start_minute = int(payload.start_minute)
+        end_minute = int(payload.end_minute)
+        default_description = "Производственное задание за выбранный период"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Неизвестный период производственного задания",
+        )
+
+    if end_minute <= start_minute:
+        raise HTTPException(
+            status_code=400,
+            detail="Конец периода должен быть больше начала периода",
+        )
+
+    description = (payload.description or "").strip() or default_description
+    return start_minute, end_minute, description
+
+
+def get_mes_schedule_run_or_404(db, run_id: int) -> MesScheduleRun:
+    run = db.query(MesScheduleRun).filter(MesScheduleRun.id == run_id).first()
+
+    if not run:
+        raise HTTPException(status_code=404, detail="Производственное задание не найдено")
+
+    return run
+
+
+def assert_mes_schedule_run_composition_editable(run: MesScheduleRun):
+    if run.status == "released":
+        raise HTTPException(
+            status_code=409,
+            detail="Нельзя изменить состав задания, уже выпущенного в производство",
+        )
+
+    if run.status == "cancelled":
+        raise HTTPException(
+            status_code=409,
+            detail="Нельзя изменить состав отменённого задания",
+        )
+
+    if run.status != "created":
+        raise HTTPException(
+            status_code=409,
+            detail="Изменять состав можно только у созданного задания",
+        )
+
+
 def get_plan_version_or_404(db, plan_version_id: int) -> PlanVersion:
     plan_version = (
         db.query(PlanVersion)
@@ -151,6 +305,598 @@ def get_requested_plan_version_id(db, plan_version_id: Optional[int]) -> int:
     return int(plan_version_id)
 
 
+def validate_plan_version(db, plan_version_id: int) -> dict:
+    plan_version = get_plan_version_or_404(db, plan_version_id)
+    errors = []
+    warnings = []
+    summary = {
+        "operations_checked": 0,
+        "duplicate_operations": 0,
+        "missing_order_operations": 0,
+        "missing_order_items": 0,
+        "missing_routing_operations": 0,
+        "missing_machines": 0,
+        "missing_rates": 0,
+        "invalid_rates": 0,
+        "invalid_machine_groups": 0,
+        "duration_errors": 0,
+        "route_buffer_errors": 0,
+        "machine_buffer_errors": 0,
+        "machine_overlap_errors": 0,
+        "frozen_zone_errors": 0,
+        "missing_plan_operations": 0,
+        "extra_plan_operations": 0,
+        "calendar_errors": 0,
+        "setup_team_conflicts": 0,
+        "missing_setup_team_links": 0,
+    }
+
+    def operation_context(row):
+        return {
+            "operation_id": row.get("operation_id"),
+            "order_no": row.get("order_no"),
+            "product_name": row.get("product_name"),
+            "operation_name": row.get("operation_name") or row.get("operation_type"),
+            "machine_id": row.get("machine_id"),
+        }
+
+    def add_error(error_type, message, row=None, details=None, summary_key=None):
+        if summary_key:
+            summary[summary_key] = summary.get(summary_key, 0) + 1
+
+        error = {
+            "type": error_type,
+            "operation_id": row.get("operation_id") if row else None,
+            "message": message,
+            "details": details or {},
+        }
+
+        if row:
+            error.update(operation_context(row))
+
+        errors.append(error)
+
+    duplicate_rows = db.execute(
+        text(
+            """
+            SELECT
+                operation_id,
+                COUNT(*) AS duplicate_count
+            FROM plan_operations
+            WHERE plan_version_id = :plan_version_id
+            GROUP BY operation_id
+            HAVING COUNT(*) > 1
+            """
+        ),
+        {"plan_version_id": plan_version_id},
+    ).mappings().all()
+
+    for row in duplicate_rows:
+        add_error(
+            "duplicate_plan_operation",
+            "В версии плана найдены дубли плановой операции",
+            {"operation_id": row["operation_id"]},
+            {"duplicate_count": row["duplicate_count"]},
+            "duplicate_operations",
+        )
+
+    rows = [
+        dict(row)
+        for row in db.execute(
+            text(
+                """
+                SELECT
+                    po.plan_version_id,
+                    po.operation_id,
+                    po.machine_id,
+                    po.start_time,
+                    po.end_time,
+                    COALESCE(po.is_locked, false) AS is_locked,
+
+                    oo.id AS order_operation_id,
+                    oo.order_item_id,
+                    oo.routing_operation_id,
+                    oo.sequence_no,
+                    oo.operation_type,
+                    oo.quantity,
+
+                    oi.id AS existing_order_item_id,
+                    oi.order_id,
+                    oi.product_id,
+
+                    o.order_no,
+
+                    p.name AS product_name,
+
+                    ro.id AS existing_routing_operation_id,
+                    ro.operation_name,
+
+                    m.id AS existing_machine_id,
+                    m.group_id AS machine_group_id,
+                    m.name AS machine_name,
+
+                    mpr.units_per_minute,
+                    COALESCE(mpr.setup_minutes, 0) AS setup_minutes
+                FROM plan_operations po
+                LEFT JOIN order_operations oo
+                  ON oo.id = po.operation_id
+                LEFT JOIN order_items oi
+                  ON oi.id = oo.order_item_id
+                LEFT JOIN orders o
+                  ON o.id = oi.order_id
+                LEFT JOIN products p
+                  ON p.id = oi.product_id
+                LEFT JOIN routing_operations ro
+                  ON ro.id = oo.routing_operation_id
+                LEFT JOIN machines m
+                  ON m.id = po.machine_id
+                LEFT JOIN machine_product_rates mpr
+                  ON mpr.product_id = oi.product_id
+                 AND mpr.machine_id = po.machine_id
+                 AND mpr.operation_type = oo.operation_type
+                WHERE po.plan_version_id = :plan_version_id
+                ORDER BY po.start_time, po.operation_id
+                """
+            ),
+            {"plan_version_id": plan_version_id},
+        ).mappings().all()
+    ]
+    summary["operations_checked"] = len(rows)
+
+    valid_route_rows = []
+    valid_machine_rows = []
+
+    for row in rows:
+        has_critical_error = False
+
+        if row["order_operation_id"] is None:
+            add_error(
+                "missing_order_operation",
+                "Операция заказа не найдена для плановой операции",
+                row,
+                {},
+                "missing_order_operations",
+            )
+            has_critical_error = True
+
+        if row["order_operation_id"] is not None and row["existing_order_item_id"] is None:
+            add_error(
+                "missing_order_item",
+                "Позиция заказа не найдена для операции",
+                row,
+                {},
+                "missing_order_items",
+            )
+            has_critical_error = True
+
+        if row["order_operation_id"] is not None and row["existing_routing_operation_id"] is None:
+            add_error(
+                "missing_routing_operation",
+                "Операция маршрута не найдена для операции заказа",
+                row,
+                {},
+                "missing_routing_operations",
+            )
+            has_critical_error = True
+
+        if row["existing_machine_id"] is None:
+            add_error(
+                "missing_machine",
+                "Станок не найден",
+                row,
+                {},
+                "missing_machines",
+            )
+            has_critical_error = True
+
+        if has_critical_error:
+            continue
+
+        allowed_group = db.execute(
+            text(
+                """
+                SELECT 1
+                FROM routing_operation_machine_groups
+                WHERE routing_operation_id = :routing_operation_id
+                  AND machine_group_id = :machine_group_id
+                LIMIT 1
+                """
+            ),
+            {
+                "routing_operation_id": row["routing_operation_id"],
+                "machine_group_id": row["machine_group_id"],
+            },
+        ).first()
+
+        if not allowed_group:
+            add_error(
+                "invalid_machine_group",
+                "Операция не может выполняться на выбранной группе оборудования",
+                row,
+                {"machine_group_id": row["machine_group_id"]},
+                "invalid_machine_groups",
+            )
+
+        rate_is_valid = True
+        if row["units_per_minute"] is None:
+            add_error(
+                "missing_rate",
+                "Для изделия нет нормы на выбранном станке",
+                row,
+                {
+                    "product_id": row["product_id"],
+                    "machine_id": row["machine_id"],
+                    "operation_type": row["operation_type"],
+                },
+                "missing_rates",
+            )
+            rate_is_valid = False
+        elif float(row["units_per_minute"]) <= 0:
+            add_error(
+                "invalid_rate",
+                "Для изделия задана некорректная норма на выбранном станке",
+                row,
+                {"units_per_minute": row["units_per_minute"]},
+                "invalid_rates",
+            )
+            rate_is_valid = False
+
+        if rate_is_valid:
+            expected_duration = ceil(
+                int(row["quantity"]) / float(row["units_per_minute"])
+            ) + int(row["setup_minutes"] or 0)
+            actual_duration = int(row["end_time"]) - int(row["start_time"])
+
+            if actual_duration != expected_duration:
+                add_error(
+                    "duration_error",
+                    "Длительность операции не соответствует норме",
+                    row,
+                    {
+                        "expected_duration": expected_duration,
+                        "actual_duration": actual_duration,
+                        "setup_minutes": int(row["setup_minutes"] or 0),
+                        "quantity": int(row["quantity"]),
+                        "units_per_minute": float(row["units_per_minute"]),
+                    },
+                    "duration_errors",
+                )
+
+            valid_machine_rows.append(row)
+
+        valid_route_rows.append(row)
+
+    first_sequence_by_order_item = {}
+    for row in valid_route_rows:
+        order_item_id = row["order_item_id"]
+        sequence_no = row["sequence_no"]
+        if order_item_id is None or sequence_no is None:
+            continue
+        first_sequence_by_order_item[order_item_id] = min(
+            first_sequence_by_order_item.get(order_item_id, sequence_no),
+            sequence_no,
+        )
+
+    route_rows_by_order_item = {}
+    for row in valid_route_rows:
+        route_rows_by_order_item.setdefault(row["order_item_id"], []).append(row)
+
+    for order_item_id, grouped_rows in route_rows_by_order_item.items():
+        if order_item_id is None:
+            continue
+        ordered = sorted(grouped_rows, key=lambda row: (row["sequence_no"], row["operation_id"]))
+        previous = None
+        for row in ordered:
+            if previous:
+                required_start = int(previous["end_time"]) + INTER_OPERATION_GAP_MINUTES
+                if int(row["start_time"]) < required_start:
+                    add_error(
+                        "route_buffer_error",
+                        "Нарушен буфер между переделами изделия",
+                        row,
+                        {
+                            "previous_operation_id": previous["operation_id"],
+                            "previous_end_time": int(previous["end_time"]),
+                            "required_start": required_start,
+                            "actual_start": int(row["start_time"]),
+                            "gap_minutes": INTER_OPERATION_GAP_MINUTES,
+                        },
+                        "route_buffer_errors",
+                    )
+            previous = row
+
+    machine_rows_by_machine = {}
+    for row in valid_machine_rows:
+        machine_rows_by_machine.setdefault(row["machine_id"], []).append(row)
+
+    for machine_id, grouped_rows in machine_rows_by_machine.items():
+        if machine_id is None:
+            continue
+        ordered = sorted(
+            grouped_rows,
+            key=lambda row: (row["start_time"], row["end_time"], row["operation_id"]),
+        )
+        previous = None
+        for row in ordered:
+            if previous:
+                is_first_order_item_operation = (
+                    row["sequence_no"]
+                    == first_sequence_by_order_item.get(row["order_item_id"])
+                )
+
+                if is_first_order_item_operation:
+                    required_start = (
+                        int(previous["start_time"])
+                        + int(previous["setup_minutes"] or 0)
+                        + MACHINE_OPERATION_GAP_MINUTES
+                    )
+                else:
+                    required_start = int(previous["end_time"]) + MACHINE_OPERATION_GAP_MINUTES
+
+                if int(row["start_time"]) < required_start:
+                    add_error(
+                        "machine_buffer_error",
+                        "Нарушен буфер между операциями на станке",
+                        row,
+                        {
+                            "previous_operation_id": previous["operation_id"],
+                            "previous_start_time": int(previous["start_time"]),
+                            "previous_end_time": int(previous["end_time"]),
+                            "previous_setup_minutes": int(previous["setup_minutes"] or 0),
+                            "required_start": required_start,
+                            "actual_start": int(row["start_time"]),
+                            "gap_minutes": MACHINE_OPERATION_GAP_MINUTES,
+                        },
+                        "machine_buffer_errors",
+                    )
+
+                if (
+                    not is_first_order_item_operation
+                    and int(row["start_time"]) < int(previous["end_time"])
+                ):
+                    add_error(
+                        "machine_overlap_error",
+                        "Операции пересекаются на одном станке",
+                        row,
+                        {
+                            "previous_operation_id": previous["operation_id"],
+                            "previous_end_time": int(previous["end_time"]),
+                            "actual_start": int(row["start_time"]),
+                        },
+                        "machine_overlap_errors",
+                    )
+            previous = row
+
+    max_end_time = max((int(row["end_time"]) for row in valid_machine_rows), default=0)
+    work_intervals = build_work_intervals(db, max_end_time)
+
+    for row in valid_machine_rows:
+        start_time = int(row["start_time"])
+        end_time = int(row["end_time"])
+        is_inside_work_interval = any(
+            start_time >= interval_start and end_time <= interval_end
+            for interval_start, interval_end in work_intervals
+        )
+
+        if not is_inside_work_interval:
+            add_error(
+                "operation_calendar_error",
+                "Операция выходит за рабочий интервал смены",
+                row,
+                {
+                    "start_time": start_time,
+                    "end_time": end_time,
+                },
+                "calendar_errors",
+            )
+
+    setup_team_links = {
+        row["machine_group_id"]: row["setup_team_id"]
+        for row in db.execute(
+            text(
+                """
+                SELECT machine_group_id, setup_team_id
+                FROM machine_group_setup_teams
+                """
+            )
+        ).mappings().all()
+    }
+    setup_team_capacity = {
+        row["id"]: int(row["capacity"] or 1)
+        for row in db.execute(
+            text(
+                """
+                SELECT id, COALESCE(capacity, 1) AS capacity
+                FROM setup_teams
+                WHERE COALESCE(is_active, true) = true
+                """
+            )
+        ).mappings().all()
+    }
+    setup_intervals_by_team = {}
+    warned_capacity_teams = set()
+
+    for row in valid_machine_rows:
+        setup_minutes = int(row["setup_minutes"] or 0)
+        if setup_minutes <= 0:
+            continue
+
+        setup_team_id = setup_team_links.get(row["machine_group_id"])
+        if not setup_team_id:
+            add_error(
+                "missing_setup_team_link",
+                "Для группы оборудования не назначена бригада наладчиков",
+                row,
+                {"machine_group_id": row["machine_group_id"]},
+                "missing_setup_team_links",
+            )
+            continue
+
+        setup_team_capacity_value = setup_team_capacity.get(setup_team_id, 1)
+        if setup_team_capacity_value > 1:
+            if setup_team_id not in warned_capacity_teams:
+                warnings.append(
+                    {
+                        "type": "setup_team_capacity_warning",
+                        "message": (
+                            "Проверка бригад наладчиков с capacity > 1 "
+                            "пока не реализована"
+                        ),
+                        "details": {
+                            "setup_team_id": setup_team_id,
+                            "capacity": setup_team_capacity_value,
+                        },
+                    }
+                )
+                warned_capacity_teams.add(setup_team_id)
+            continue
+
+        setup_start = int(row["start_time"])
+        setup_end = setup_start + setup_minutes
+        setup_intervals_by_team.setdefault(setup_team_id, []).append(
+            {
+                "operation_id": row["operation_id"],
+                "row": row,
+                "setup_start": setup_start,
+                "setup_end": setup_end,
+            }
+        )
+
+    for setup_team_id, intervals in setup_intervals_by_team.items():
+        previous = None
+        for interval in sorted(
+            intervals,
+            key=lambda item: (
+                item["setup_start"],
+                item["setup_end"],
+                item["operation_id"],
+            ),
+        ):
+            if previous and interval["setup_start"] < previous["setup_end"]:
+                add_error(
+                    "setup_team_conflict",
+                    "Конфликт наладчиков: наладки одной бригады пересекаются",
+                    interval["row"],
+                    {
+                        "setup_team_id": setup_team_id,
+                        "previous_operation_id": previous["operation_id"],
+                        "previous_setup_start": previous["setup_start"],
+                        "previous_setup_end": previous["setup_end"],
+                        "setup_start": interval["setup_start"],
+                        "setup_end": interval["setup_end"],
+                    },
+                    "setup_team_conflicts",
+                )
+
+            previous = interval
+
+    if plan_version.status == "draft":
+        active_plan_version_id = get_active_plan_version_id(db)
+        active_operation_ids = {
+            row["operation_id"]
+            for row in db.execute(
+                text(
+                    """
+                    SELECT operation_id
+                    FROM plan_operations
+                    WHERE plan_version_id = :plan_version_id
+                    """
+                ),
+                {"plan_version_id": active_plan_version_id},
+            ).mappings().all()
+        }
+        draft_operation_ids = {row["operation_id"] for row in rows}
+
+        for operation_id in sorted(active_operation_ids - draft_operation_ids):
+            add_error(
+                "missing_plan_operation",
+                "В версии плана отсутствует операция из active-плана",
+                {"operation_id": operation_id},
+                {"active_plan_version_id": active_plan_version_id},
+                "missing_plan_operations",
+            )
+
+        for operation_id in sorted(draft_operation_ids - active_operation_ids):
+            add_error(
+                "extra_plan_operation",
+                "В версии плана есть лишняя операция относительно active-плана",
+                {"operation_id": operation_id},
+                {"active_plan_version_id": active_plan_version_id},
+                "extra_plan_operations",
+            )
+
+        freeze_horizon_minutes = get_freeze_horizon_minutes(db)
+        frozen_rows = db.execute(
+            text(
+                """
+                SELECT
+                    draft_po.operation_id,
+                    active_po.machine_id AS active_machine_id,
+                    draft_po.machine_id AS draft_machine_id,
+                    active_po.start_time AS active_start_time,
+                    draft_po.start_time AS draft_start_time,
+                    active_po.end_time AS active_end_time,
+                    draft_po.end_time AS draft_end_time,
+                    o.order_no,
+                    p.name AS product_name,
+                    ro.operation_name
+                FROM plan_operations draft_po
+                JOIN plan_operations active_po
+                  ON active_po.operation_id = draft_po.operation_id
+                LEFT JOIN order_operations oo
+                  ON oo.id = draft_po.operation_id
+                LEFT JOIN order_items oi
+                  ON oi.id = oo.order_item_id
+                LEFT JOIN orders o
+                  ON o.id = oi.order_id
+                LEFT JOIN products p
+                  ON p.id = oi.product_id
+                LEFT JOIN routing_operations ro
+                  ON ro.id = oo.routing_operation_id
+                WHERE draft_po.plan_version_id = :draft_plan_version_id
+                  AND active_po.plan_version_id = :active_plan_version_id
+                  AND active_po.start_time < :freeze_horizon_minutes
+                  AND (
+                      active_po.machine_id IS DISTINCT FROM draft_po.machine_id
+                      OR active_po.start_time IS DISTINCT FROM draft_po.start_time
+                      OR active_po.end_time IS DISTINCT FROM draft_po.end_time
+                  )
+                """
+            ),
+            {
+                "draft_plan_version_id": plan_version_id,
+                "active_plan_version_id": active_plan_version_id,
+                "freeze_horizon_minutes": freeze_horizon_minutes,
+            },
+        ).mappings().all()
+
+        for row in frozen_rows:
+            add_error(
+                "frozen_zone_error",
+                "Операция в замороженной зоне отличается от active-плана",
+                dict(row),
+                {
+                    "freeze_horizon_minutes": freeze_horizon_minutes,
+                    "active_machine_id": row["active_machine_id"],
+                    "draft_machine_id": row["draft_machine_id"],
+                    "active_start_time": row["active_start_time"],
+                    "draft_start_time": row["draft_start_time"],
+                    "active_end_time": row["active_end_time"],
+                    "draft_end_time": row["draft_end_time"],
+                },
+                "frozen_zone_errors",
+            )
+
+    is_valid = len(errors) == 0
+    return {
+        "status": "ok" if is_valid else "error",
+        "is_valid": is_valid,
+        "errors": errors,
+        "warnings": warnings,
+        "summary": summary,
+    }
+
+
 # ======================
 # CORS
 # ======================
@@ -169,6 +915,516 @@ app.add_middleware(
 @app.get("/")
 def root():
     return {"status": "backend works"}
+
+
+@app.get("/calendar/non_working_intervals")
+def get_calendar_non_working_intervals(
+    from_minute: int = 0,
+    to_minute: int = 0,
+):
+    if to_minute <= from_minute:
+        raise HTTPException(
+            status_code=400,
+            detail="Правая граница диапазона должна быть больше левой",
+        )
+
+    db = SessionLocal()
+    try:
+        return build_non_working_intervals(db, from_minute, to_minute)
+    finally:
+        db.close()
+
+
+# ======================
+# MES SCHEDULE RUNS
+# ======================
+@app.get("/mes/schedule_runs")
+def list_mes_schedule_runs(include_hidden: bool = False):
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT
+                    msr.*,
+                    COUNT(mso.id) AS operations_count
+                FROM mes_schedule_runs msr
+                LEFT JOIN mes_schedule_operations mso
+                  ON mso.schedule_run_id = msr.id
+                WHERE (:include_hidden = true OR COALESCE(msr.is_hidden, false) = false)
+                GROUP BY msr.id
+                ORDER BY msr.id DESC
+                """
+            ),
+            {"include_hidden": include_hidden},
+        ).mappings().all()
+
+        result = []
+        for row in rows:
+            item = serialize_mes_schedule_run(row)
+            item["operations_count"] = int(row["operations_count"] or 0)
+            result.append(item)
+
+        return result
+    finally:
+        db.close()
+
+
+@app.post("/mes/schedule_runs/from_active")
+def create_mes_schedule_run_from_active(payload: MesScheduleRunCreatePayload):
+    db = SessionLocal()
+    try:
+        start_minute, end_minute, description = resolve_mes_schedule_period(payload)
+        active_plan_version_id = get_active_plan_version_id(db)
+        validation_result = validate_plan_version(db, active_plan_version_id)
+
+        if not validation_result["is_valid"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Нельзя создать производственное задание: активный план содержит ошибки",
+                    "errors": validation_result["errors"],
+                    "summary": validation_result["summary"],
+                },
+            )
+
+        duplicate_run = (
+            db.query(MesScheduleRun)
+            .filter(MesScheduleRun.source_plan_version_id == active_plan_version_id)
+            .filter(MesScheduleRun.start_minute == start_minute)
+            .filter(MesScheduleRun.end_minute == end_minute)
+            .filter(MesScheduleRun.status.in_(["created", "released"]))
+            .first()
+        )
+
+        if duplicate_run:
+            raise HTTPException(
+                status_code=409,
+                detail="Для этой версии плана и периода уже создано производственное задание",
+            )
+
+        operations_count = db.execute(
+            text(
+                """
+                SELECT COUNT(*) AS operations_count
+                FROM plan_operations po
+                WHERE po.plan_version_id = :plan_version_id
+                  AND po.start_time >= :start_minute
+                  AND po.start_time < :end_minute
+                """
+            ),
+            {
+                "plan_version_id": active_plan_version_id,
+                "start_minute": start_minute,
+                "end_minute": end_minute,
+            },
+        ).scalar()
+
+        if not operations_count:
+            raise HTTPException(
+                status_code=409,
+                detail="В выбранном периоде нет операций для производственного задания",
+            )
+
+        run = MesScheduleRun(
+            source_plan_version_id=active_plan_version_id,
+            start_minute=start_minute,
+            end_minute=end_minute,
+            status="created",
+            created_by="system",
+            description=description,
+        )
+        db.add(run)
+        db.flush()
+
+        db.execute(
+            text(
+                """
+                INSERT INTO mes_schedule_operations (
+                    schedule_run_id,
+                    source_plan_operation_id,
+                    operation_id,
+                    order_id,
+                    order_item_id,
+                    product_id,
+                    product_name,
+                    order_no,
+                    machine_id,
+                    machine_name,
+                    machine_group_id,
+                    operation_type,
+                    operation_name,
+                    quantity,
+                    setup_minutes,
+                    planned_start_time,
+                    planned_end_time,
+                    status
+                )
+                SELECT
+                    :schedule_run_id,
+                    po.id,
+                    po.operation_id,
+                    oi.order_id,
+                    oo.order_item_id,
+                    oi.product_id,
+                    p.name,
+                    o.order_no,
+                    po.machine_id,
+                    m.name,
+                    m.group_id,
+                    oo.operation_type,
+                    ro.operation_name,
+                    oo.quantity,
+                    COALESCE(mpr.setup_minutes, 0),
+                    po.start_time,
+                    po.end_time,
+                    'planned'
+                FROM plan_operations po
+                JOIN order_operations oo ON oo.id = po.operation_id
+                JOIN order_items oi ON oi.id = oo.order_item_id
+                LEFT JOIN orders o ON o.id = oi.order_id
+                LEFT JOIN products p ON p.id = oi.product_id
+                LEFT JOIN machines m ON m.id = po.machine_id
+                LEFT JOIN routing_operations ro ON ro.id = oo.routing_operation_id
+                LEFT JOIN machine_product_rates mpr
+                  ON mpr.product_id = oi.product_id
+                 AND mpr.machine_id = po.machine_id
+                 AND mpr.operation_type = oo.operation_type
+                WHERE po.plan_version_id = :plan_version_id
+                  AND po.start_time >= :start_minute
+                  AND po.start_time < :end_minute
+                ORDER BY po.start_time, po.operation_id
+                """
+            ),
+            {
+                "schedule_run_id": run.id,
+                "plan_version_id": active_plan_version_id,
+                "start_minute": start_minute,
+                "end_minute": end_minute,
+            },
+        )
+
+        db.commit()
+        db.refresh(run)
+
+        return {
+            "status": "ok",
+            "run": serialize_mes_schedule_run(run),
+            "operations_count": int(operations_count),
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось создать производственное задание: {error}",
+        )
+    finally:
+        db.close()
+
+
+@app.get("/mes/schedule_runs/{run_id}")
+def get_mes_schedule_run(run_id: int):
+    db = SessionLocal()
+    try:
+        run = get_mes_schedule_run_or_404(db, run_id)
+        operations = (
+            db.query(MesScheduleOperation)
+            .filter(MesScheduleOperation.schedule_run_id == run_id)
+            .order_by(
+                MesScheduleOperation.planned_start_time,
+                MesScheduleOperation.id,
+            )
+            .all()
+        )
+
+        return {
+            "run": serialize_mes_schedule_run(run),
+            "operations": [
+                serialize_mes_schedule_operation(operation)
+                for operation in operations
+            ],
+        }
+    finally:
+        db.close()
+
+
+@app.post("/mes/schedule_runs/{run_id}/release")
+def release_mes_schedule_run(run_id: int):
+    db = SessionLocal()
+    try:
+        run = get_mes_schedule_run_or_404(db, run_id)
+
+        if run.status == "released":
+            raise HTTPException(
+                status_code=409,
+                detail="Производственное задание уже выпущено в производство",
+            )
+
+        if run.status == "cancelled":
+            raise HTTPException(
+                status_code=409,
+                detail="Нельзя выпустить отменённое производственное задание",
+            )
+
+        if run.status != "created":
+            raise HTTPException(
+                status_code=409,
+                detail="В производство можно выпустить только созданное задание",
+            )
+
+        run.status = "released"
+        run.released_by = "system"
+        db.execute(
+            text(
+                """
+                UPDATE mes_schedule_runs
+                SET released_at = now()
+                WHERE id = :run_id
+                """
+            ),
+            {"run_id": run_id},
+        )
+        db.execute(
+            text(
+                """
+                UPDATE mes_schedule_operations
+                SET status = 'released'
+                WHERE schedule_run_id = :run_id
+                  AND status = 'planned'
+                """
+            ),
+            {"run_id": run_id},
+        )
+        db.commit()
+        db.refresh(run)
+
+        return {"status": "ok", "run": serialize_mes_schedule_run(run)}
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось выпустить производственное задание: {error}",
+        )
+    finally:
+        db.close()
+
+
+@app.post("/mes/schedule_runs/{run_id}/cancel")
+def cancel_mes_schedule_run(run_id: int):
+    db = SessionLocal()
+    try:
+        run = get_mes_schedule_run_or_404(db, run_id)
+
+        if run.status == "released":
+            raise HTTPException(
+                status_code=409,
+                detail="Нельзя отменить производственное задание, уже выпущенное в производство",
+            )
+
+        if run.status == "cancelled":
+            raise HTTPException(
+                status_code=409,
+                detail="Производственное задание уже отменено",
+            )
+
+        if run.status != "created":
+            raise HTTPException(
+                status_code=409,
+                detail="Отменить можно только созданное производственное задание",
+            )
+
+        run.status = "cancelled"
+        run.cancelled_by = "system"
+        db.execute(
+            text(
+                """
+                UPDATE mes_schedule_runs
+                SET cancelled_at = now()
+                WHERE id = :run_id
+                """
+            ),
+            {"run_id": run_id},
+        )
+        db.commit()
+        db.refresh(run)
+
+        return {"status": "ok", "run": serialize_mes_schedule_run(run)}
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось отменить производственное задание: {error}",
+        )
+    finally:
+        db.close()
+
+
+@app.post("/mes/schedule_runs/{run_id}/hide")
+def hide_mes_schedule_run(run_id: int):
+    db = SessionLocal()
+    try:
+        run = get_mes_schedule_run_or_404(db, run_id)
+        run.is_hidden = True
+        db.commit()
+        db.refresh(run)
+
+        return {"status": "ok", "run": serialize_mes_schedule_run(run)}
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось скрыть производственное задание: {error}",
+        )
+    finally:
+        db.close()
+
+
+@app.post("/mes/schedule_runs/{run_id}/show")
+def show_mes_schedule_run(run_id: int):
+    db = SessionLocal()
+    try:
+        run = get_mes_schedule_run_or_404(db, run_id)
+        run.is_hidden = False
+        db.commit()
+        db.refresh(run)
+
+        return {"status": "ok", "run": serialize_mes_schedule_run(run)}
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось вернуть производственное задание в список: {error}",
+        )
+    finally:
+        db.close()
+
+
+@app.post("/mes/schedule_runs/{run_id}/order_items/{order_item_id}/exclude")
+def exclude_mes_schedule_order_item(run_id: int, order_item_id: int):
+    db = SessionLocal()
+    try:
+        run = get_mes_schedule_run_or_404(db, run_id)
+        assert_mes_schedule_run_composition_editable(run)
+
+        operations_count = (
+            db.query(MesScheduleOperation)
+            .filter(MesScheduleOperation.schedule_run_id == run_id)
+            .filter(MesScheduleOperation.order_item_id == order_item_id)
+            .count()
+        )
+
+        if operations_count == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="Позиция заказа не найдена в производственном задании",
+            )
+
+        updated = db.execute(
+            text(
+                """
+                UPDATE mes_schedule_operations
+                SET status = 'excluded'
+                WHERE schedule_run_id = :run_id
+                  AND order_item_id = :order_item_id
+                  AND status = 'planned'
+                """
+            ),
+            {"run_id": run_id, "order_item_id": order_item_id},
+        )
+        db.commit()
+
+        return {
+            "status": "ok",
+            "schedule_run_id": run_id,
+            "order_item_id": order_item_id,
+            "updated_operations": updated.rowcount or 0,
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось исключить позицию из задания: {error}",
+        )
+    finally:
+        db.close()
+
+
+@app.post("/mes/schedule_runs/{run_id}/order_items/{order_item_id}/include")
+def include_mes_schedule_order_item(run_id: int, order_item_id: int):
+    db = SessionLocal()
+    try:
+        run = get_mes_schedule_run_or_404(db, run_id)
+        assert_mes_schedule_run_composition_editable(run)
+
+        operations_count = (
+            db.query(MesScheduleOperation)
+            .filter(MesScheduleOperation.schedule_run_id == run_id)
+            .filter(MesScheduleOperation.order_item_id == order_item_id)
+            .count()
+        )
+
+        if operations_count == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="Позиция заказа не найдена в производственном задании",
+            )
+
+        updated = db.execute(
+            text(
+                """
+                UPDATE mes_schedule_operations
+                SET status = 'planned'
+                WHERE schedule_run_id = :run_id
+                  AND order_item_id = :order_item_id
+                  AND status = 'excluded'
+                """
+            ),
+            {"run_id": run_id, "order_item_id": order_item_id},
+        )
+        db.commit()
+
+        return {
+            "status": "ok",
+            "schedule_run_id": run_id,
+            "order_item_id": order_item_id,
+            "updated_operations": updated.rowcount or 0,
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось вернуть позицию в задание: {error}",
+        )
+    finally:
+        db.close()
 
 
 # ======================
@@ -268,6 +1524,240 @@ def clone_active_plan_version():
         raise HTTPException(
             status_code=500,
             detail=f"Не удалось создать копию активного плана: {error}",
+        )
+    finally:
+        db.close()
+
+
+@app.patch("/plan_versions/{plan_version_id}")
+async def update_plan_version(
+    plan_version_id: int,
+    payload: PlanVersionUpdatePayload,
+):
+    db = SessionLocal()
+    try:
+        plan_version = get_plan_version_or_404(db, plan_version_id)
+
+        if payload.name is not None:
+            if plan_version.status != "draft":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Название можно редактировать только у черновой версии плана",
+                )
+
+            name = payload.name.strip()
+            if not name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Название версии плана не должно быть пустым",
+                )
+            plan_version.name = name
+
+        if payload.description is not None:
+            description = payload.description.strip()
+            plan_version.description = description or None
+
+        db.commit()
+        db.refresh(plan_version)
+
+        event = {
+            "type": "plan_versions_updated",
+            "data": {
+                "updated_plan_version": serialize_plan_version(plan_version),
+            },
+        }
+
+        try:
+            await broadcast(event)
+        except Exception as error:
+            print(
+                "Предупреждение: не удалось отправить WebSocket-событие "
+                f"обновления версии плана: {error}"
+            )
+
+        return {
+            "status": "ok",
+            "plan_version": serialize_plan_version(plan_version),
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось обновить версию плана: {error}",
+        )
+    finally:
+        db.close()
+
+
+@app.delete("/plan_versions/{plan_version_id}")
+async def delete_plan_version(plan_version_id: int):
+    db = SessionLocal()
+    try:
+        plan_version = get_plan_version_or_404(db, plan_version_id)
+
+        if plan_version.status != "draft":
+            raise HTTPException(
+                status_code=409,
+                detail="Удалять можно только черновую версию плана",
+            )
+
+        deleted_change_log = db.execute(
+            text(
+                """
+                DELETE FROM plan_change_log
+                WHERE plan_version_id = :plan_version_id
+                """
+            ),
+            {"plan_version_id": plan_version_id},
+        )
+
+        deleted_plan_operations = db.execute(
+            text(
+                """
+                DELETE FROM plan_operations
+                WHERE plan_version_id = :plan_version_id
+                """
+            ),
+            {"plan_version_id": plan_version_id},
+        )
+
+        db.delete(plan_version)
+        db.commit()
+
+        event = {
+            "type": "plan_versions_updated",
+            "data": {
+                "deleted_plan_version_id": plan_version_id,
+            },
+        }
+
+        try:
+            await broadcast(event)
+        except Exception as error:
+            print(
+                "Предупреждение: не удалось отправить WebSocket-событие "
+                f"удаления версии плана: {error}"
+            )
+
+        return {
+            "status": "ok",
+            "deleted_plan_version_id": plan_version_id,
+            "deleted_plan_operations": deleted_plan_operations.rowcount or 0,
+            "deleted_change_log": deleted_change_log.rowcount or 0,
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось удалить черновую версию плана: {error}",
+        )
+    finally:
+        db.close()
+
+
+@app.get("/plan_versions/{plan_version_id}/validate")
+def validate_plan_version_endpoint(plan_version_id: int):
+    db = SessionLocal()
+    try:
+        get_plan_version_or_404(db, plan_version_id)
+        return validate_plan_version(db, plan_version_id)
+    finally:
+        db.close()
+
+
+@app.post("/plan_versions/{plan_version_id}/approve")
+async def approve_plan_version(plan_version_id: int):
+    db = SessionLocal()
+    try:
+        draft_version = get_plan_version_or_404(db, plan_version_id)
+
+        if draft_version.status != "draft":
+            raise HTTPException(
+                status_code=409,
+                detail="Принять можно только черновую версию плана",
+            )
+
+        validation_result = validate_plan_version(db, plan_version_id)
+        if not validation_result["is_valid"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Нельзя принять черновик: план содержит ошибки",
+                    "errors": validation_result["errors"],
+                    "summary": validation_result["summary"],
+                },
+            )
+
+        active_versions = (
+            db.query(PlanVersion)
+            .filter(PlanVersion.status == "active")
+            .all()
+        )
+
+        if len(active_versions) != 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Найдено несколько активных версий плана. Оставьте только одну активную версию",
+            )
+
+        old_active_version = active_versions[0]
+        old_active_version.status = "archived"
+
+        draft_version.status = "active"
+        draft_version.approved_by = "system"
+
+        db.execute(
+            text(
+                """
+                UPDATE plan_versions
+                SET approved_at = now()
+                WHERE id = :plan_version_id
+                """
+            ),
+            {"plan_version_id": plan_version_id},
+        )
+
+        db.commit()
+        db.refresh(draft_version)
+
+        event = {
+            "type": "plan_versions_updated",
+            "data": {
+                "active_plan_version_id": draft_version.id,
+                "archived_plan_version_id": old_active_version.id,
+            },
+        }
+
+        try:
+            await broadcast(event)
+        except Exception as error:
+            print(
+                "Предупреждение: не удалось отправить WebSocket-событие "
+                f"принятия версии плана: {error}"
+            )
+
+        return {
+            "status": "ok",
+            "active_plan_version": serialize_plan_version(draft_version),
+            "archived_plan_version_id": old_active_version.id,
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось принять черновую версию плана: {error}",
         )
     finally:
         db.close()
@@ -787,7 +2277,10 @@ def get_operations(plan_version_id: Optional[int] = None):
                     onum.item_no,
                     onum.product_name,
                     onum.operation_no,
-                    coalesce(mpr.setup_minutes, 0) AS setup_minutes
+                    coalesce(mpr.setup_minutes, 0) AS setup_minutes,
+                    mes.schedule_run_id AS mes_schedule_run_id,
+                    mes.mes_schedule_status,
+                    mes.mes_operation_status
                 FROM plan_operations po
                 LEFT JOIN machines m ON m.id = po.machine_id
                 LEFT JOIN order_operations oo ON oo.id = po.operation_id
@@ -798,6 +2291,25 @@ def get_operations(plan_version_id: Optional[int] = None):
                   ON mpr.product_id = oi.product_id
                  AND mpr.machine_id = po.machine_id
                  AND mpr.operation_type = oo.operation_type
+                LEFT JOIN LATERAL (
+                    SELECT
+                        mso.schedule_run_id,
+                        mso.status AS mes_operation_status,
+                        msr.status AS mes_schedule_status
+                    FROM mes_schedule_operations mso
+                    JOIN mes_schedule_runs msr
+                      ON msr.id = mso.schedule_run_id
+                    WHERE mso.source_plan_operation_id = po.id
+                      AND msr.status IN ('created', 'released')
+                    ORDER BY
+                      CASE msr.status
+                        WHEN 'released' THEN 1
+                        WHEN 'created' THEN 2
+                        ELSE 3
+                      END,
+                      msr.id DESC
+                    LIMIT 1
+                ) mes ON true
                 WHERE po.plan_version_id = :plan_version_id
                 ORDER BY po.start_time, po.operation_id
                 """
@@ -829,6 +2341,9 @@ def get_operations(plan_version_id: Optional[int] = None):
                 "setup_minutes": int(row["setup_minutes"] or 0),
                 "start": int(row["start_time"]) if row["start_time"] is not None else 0,
                 "end": int(row["end_time"]) if row["end_time"] is not None else 0,
+                "mes_schedule_run_id": row["mes_schedule_run_id"],
+                "mes_schedule_status": row["mes_schedule_status"],
+                "mes_operation_status": row["mes_operation_status"],
             }
             for row in rows
         ]
@@ -945,6 +2460,34 @@ async def update_operation(
                     "current_start": current_start_time,
                     "freeze_horizon_minutes": freeze_horizon_minutes,
                 },
+            )
+
+        mes_lock = db.execute(
+            text(
+                """
+                SELECT
+                    mso.schedule_run_id,
+                    msr.status AS schedule_status,
+                    mso.status AS operation_status
+                FROM mes_schedule_operations mso
+                JOIN mes_schedule_runs msr
+                  ON msr.id = mso.schedule_run_id
+                WHERE mso.source_plan_operation_id = :plan_operation_id
+                  AND msr.status = 'released'
+                  AND mso.status = 'released'
+                LIMIT 1
+                """
+            ),
+            {"plan_operation_id": op.id},
+        ).mappings().first()
+
+        if mes_lock:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Операция уже выпущена в производственное задание "
+                    f"№{mes_lock['schedule_run_id']} и не может быть изменена в APS"
+                ),
             )
 
         if isinstance(op.machine_id, int):
@@ -1085,6 +2628,16 @@ async def update_operation(
         duration_minutes = ceil(quantity / units_per_minute) + setup_minutes
         calculated_end = start + duration_minutes
 
+        if not is_inside_work_interval(db, start, calculated_end):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Операция должна полностью находиться в рабочем интервале смены",
+                    "start_time": start,
+                    "end_time": calculated_end,
+                },
+            )
+
         previous_operation = db.execute(
             text(
                 """
@@ -1158,6 +2711,32 @@ async def update_operation(
             raise HTTPException(
                 status_code=409,
                 detail=f"Невозможно перепланировать план после ручного изменения: {error}",
+            )
+
+        validation_result = validate_plan_version(db, requested_plan_version_id)
+        if not validation_result["is_valid"]:
+            first_error = (
+                validation_result["errors"][0]
+                if validation_result.get("errors")
+                else None
+            )
+            first_error_message = (
+                first_error.get("message")
+                if isinstance(first_error, dict)
+                else None
+            )
+            message = "После переноса план содержит ошибки"
+            if first_error_message:
+                message = f"{message}: {first_error_message}"
+
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": message,
+                    "errors": validation_result["errors"],
+                    "summary": validation_result["summary"],
+                },
             )
 
         db.commit()

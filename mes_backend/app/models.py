@@ -70,3 +70,84 @@ class RoutingOperationMachineGroup(Base):
     id = Column(Integer, primary_key=True)
     routing_operation_id = Column(Integer)
     machine_group_id = Column(String)
+
+
+class ShiftTemplate(Base):
+    __tablename__ = "shift_templates"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    start_minute_of_day = Column(Integer)
+    end_minute_of_day = Column(Integer)
+    prep_minutes = Column(Integer, default=0)
+    finish_minutes = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
+
+
+class ShiftTemplateBreak(Base):
+    __tablename__ = "shift_template_breaks"
+
+    id = Column(Integer, primary_key=True)
+    shift_template_id = Column(Integer)
+    name = Column(String)
+    start_minute_of_shift = Column(Integer)
+    end_minute_of_shift = Column(Integer)
+
+
+class SetupTeam(Base):
+    __tablename__ = "setup_teams"
+
+    id = Column(String, primary_key=True)
+    name = Column(String)
+    capacity = Column(Integer, default=1)
+    is_active = Column(Boolean, default=True)
+
+
+class MachineGroupSetupTeam(Base):
+    __tablename__ = "machine_group_setup_teams"
+
+    id = Column(Integer, primary_key=True)
+    machine_group_id = Column(String)
+    setup_team_id = Column(String)
+
+
+class MesScheduleRun(Base):
+    __tablename__ = "mes_schedule_runs"
+
+    id = Column(Integer, primary_key=True)
+    source_plan_version_id = Column(Integer)
+    start_minute = Column(Integer)
+    end_minute = Column(Integer)
+    status = Column(String)
+    created_at = Column(DateTime, server_default=func.now())
+    created_by = Column(String)
+    released_at = Column(DateTime)
+    released_by = Column(String)
+    cancelled_at = Column(DateTime)
+    cancelled_by = Column(String)
+    description = Column(String)
+    is_hidden = Column(Boolean, default=False)
+
+
+class MesScheduleOperation(Base):
+    __tablename__ = "mes_schedule_operations"
+
+    id = Column(Integer, primary_key=True)
+    schedule_run_id = Column(Integer)
+    source_plan_operation_id = Column(Integer)
+    operation_id = Column(Integer)
+    order_id = Column(Integer)
+    order_item_id = Column(Integer)
+    product_id = Column(String)
+    product_name = Column(String)
+    order_no = Column(String)
+    machine_id = Column(String)
+    machine_name = Column(String)
+    machine_group_id = Column(String)
+    operation_type = Column(String)
+    operation_name = Column(String)
+    quantity = Column(Integer)
+    setup_minutes = Column(Integer)
+    planned_start_time = Column(Integer)
+    planned_end_time = Column(Integer)
+    status = Column(String)
