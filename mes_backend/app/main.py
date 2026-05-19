@@ -1524,6 +1524,76 @@ def get_mes_schedule_run(run_id: int):
         db.close()
 
 
+@app.get("/mes/workplace_operations")
+def get_mes_workplace_operations(workshop_id: Optional[int] = None):
+    db = SessionLocal()
+    try:
+        if workshop_id is not None:
+            workshop = db.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM workshops
+                    WHERE id = :workshop_id
+                    """
+                ),
+                {"workshop_id": workshop_id},
+            ).mappings().first()
+
+            if not workshop:
+                raise HTTPException(status_code=404, detail="Участок не найден")
+
+        operations = db.execute(
+            text(
+                """
+                SELECT
+                    mso.*,
+                    msr.status AS schedule_run_status,
+                    w.id AS workshop_id,
+                    w.code AS workshop_code,
+                    COALESCE(w.name, 'Без участка') AS workshop_name,
+                    w.responsible_name
+                FROM mes_schedule_operations mso
+                JOIN mes_schedule_runs msr
+                  ON msr.id = mso.schedule_run_id
+                LEFT JOIN workshop_machine_groups wmg
+                  ON wmg.machine_group_id = mso.machine_group_id
+                LEFT JOIN workshops w
+                  ON w.id = wmg.workshop_id
+                WHERE msr.status IN ('created', 'released', 'in_work')
+                  AND mso.status IN ('released', 'in_work', 'partially_completed')
+                  AND (:workshop_id IS NULL OR w.id = :workshop_id)
+                ORDER BY
+                    COALESCE(w.sort_order, 999),
+                    CASE mso.status
+                        WHEN 'in_work' THEN 1
+                        WHEN 'partially_completed' THEN 2
+                        WHEN 'released' THEN 3
+                        WHEN 'planned' THEN 4
+                        WHEN 'completed' THEN 5
+                        WHEN 'excluded' THEN 6
+                        ELSE 99
+                    END,
+                    mso.planned_start_time,
+                    mso.machine_id,
+                    mso.order_no
+                """
+            ),
+            {"workshop_id": workshop_id},
+        ).mappings().all()
+
+        result = []
+        for operation in operations:
+            item = serialize_mes_schedule_operation_for_response(db, operation)
+            item["schedule_run_status"] = operation["schedule_run_status"]
+            result.append(item)
+
+        return result
+
+    finally:
+        db.close()
+
+
 @app.post("/mes/schedule_runs/{run_id}/release")
 def release_mes_schedule_run(run_id: int):
     db = SessionLocal()

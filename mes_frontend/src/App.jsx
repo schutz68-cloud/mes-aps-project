@@ -233,6 +233,17 @@ function App() {
   const [mesScheduleRuns, setMesScheduleRuns] = useState([]);
   const [selectedMesRun, setSelectedMesRun] = useState(null);
   const [selectedMesRunOperations, setSelectedMesRunOperations] = useState([]);
+  const [mesScreen, setMesScreen] = useState("runs");
+  const [mesWorkplaceOperations, setMesWorkplaceOperations] = useState([]);
+  const [isMesWorkplaceLoading, setIsMesWorkplaceLoading] = useState(false);
+  const [selectedMesOperationCard, setSelectedMesOperationCard] =
+    useState(null);
+  const [mesOperationCardTab, setMesOperationCardTab] = useState("fact");
+  const [mesOperationCardReports, setMesOperationCardReports] = useState([]);
+  const [
+    isMesOperationCardReportsLoading,
+    setIsMesOperationCardReportsLoading,
+  ] = useState(false);
   const [selectedMesOperationForReports, setSelectedMesOperationForReports] =
     useState(null);
   const [selectedMesOperationReports, setSelectedMesOperationReports] =
@@ -478,6 +489,39 @@ function App() {
       .catch(() => {});
   }, []);
 
+  const loadMesWorkplaceOperations = useCallback(async () => {
+    setIsMesWorkplaceLoading(true);
+
+    try {
+      const params = new URLSearchParams();
+
+      if (selectedMesWorkshopId) {
+        params.set("workshop_id", selectedMesWorkshopId);
+      }
+
+      const res = await fetch(
+        `http://127.0.0.1:8000/mes/workplace_operations?${params.toString()}`
+      );
+      const data = await res.json();
+
+      if (!res.ok) {
+        const detail = data?.detail?.message || data?.detail;
+        alert(
+          "Не удалось загрузить рабочее место мастера: " +
+            (detail || JSON.stringify(data))
+        );
+        return;
+      }
+
+      setMesWorkplaceOperations(Array.isArray(data) ? data : []);
+    } catch (error) {
+      console.error("Ошибка загрузки рабочего места мастера:", error);
+      alert("Не удалось загрузить рабочее место мастера");
+    } finally {
+      setIsMesWorkplaceLoading(false);
+    }
+  }, [selectedMesWorkshopId]);
+
   useEffect(() => {
     loadFreezeHorizon();
     loadActivePlanVersion();
@@ -513,7 +557,15 @@ function App() {
   useEffect(() => {
     setSelectedMesOperationForReports(null);
     setSelectedMesOperationReports([]);
+    setSelectedMesOperationCard(null);
+    setMesOperationCardReports([]);
   }, [selectedMesWorkshopId]);
+
+  useEffect(() => {
+    if (currentScreen === "mes" && mesScreen === "workplace") {
+      loadMesWorkplaceOperations();
+    }
+  }, [currentScreen, mesScreen, loadMesWorkplaceOperations]);
 
   useEffect(() => {
     if (!selectedMesRun) {
@@ -1233,6 +1285,7 @@ function App() {
         }
 
         await loadMesScheduleRuns();
+        await loadMesWorkplaceOperations();
         loadOperations();
         alert("Производственное задание создано");
       } catch (error) {
@@ -1240,7 +1293,7 @@ function App() {
         alert("Не удалось создать производственное задание");
       }
     },
-    [loadMesScheduleRuns, loadOperations]
+    [loadMesScheduleRuns, loadMesWorkplaceOperations, loadOperations]
   );
 
   const handleOpenMesRun = useCallback(async (runId, options = {}) => {
@@ -1266,6 +1319,8 @@ function App() {
       if (!options.keepReports) {
         setSelectedMesOperationForReports(null);
         setSelectedMesOperationReports([]);
+        setSelectedMesOperationCard(null);
+        setMesOperationCardReports([]);
       }
     } catch (error) {
       console.error("Ошибка открытия производственного задания:", error);
@@ -1301,6 +1356,7 @@ function App() {
           await handleOpenMesRun(runId);
         }
 
+        await loadMesWorkplaceOperations();
         loadOperations();
         alert("Производственное задание выпущено в производство");
       } catch (error) {
@@ -1308,7 +1364,13 @@ function App() {
         alert("Не удалось выпустить производственное задание");
       }
     },
-    [handleOpenMesRun, loadMesScheduleRuns, loadOperations, selectedMesRun]
+    [
+      handleOpenMesRun,
+      loadMesScheduleRuns,
+      loadMesWorkplaceOperations,
+      loadOperations,
+      selectedMesRun,
+    ]
   );
 
   const handleCancelMesRun = useCallback(
@@ -1339,6 +1401,7 @@ function App() {
           await handleOpenMesRun(runId);
         }
 
+        await loadMesWorkplaceOperations();
         loadOperations();
         alert("Производственное задание отменено");
       } catch (error) {
@@ -1346,7 +1409,13 @@ function App() {
         alert("Не удалось отменить производственное задание");
       }
     },
-    [handleOpenMesRun, loadMesScheduleRuns, loadOperations, selectedMesRun]
+    [
+      handleOpenMesRun,
+      loadMesScheduleRuns,
+      loadMesWorkplaceOperations,
+      loadOperations,
+      selectedMesRun,
+    ]
   );
 
   const handleHideMesRun = useCallback(
@@ -1377,9 +1446,12 @@ function App() {
           setSelectedMesRunOperations([]);
           setSelectedMesOperationForReports(null);
           setSelectedMesOperationReports([]);
+          setSelectedMesOperationCard(null);
+          setMesOperationCardReports([]);
         }
 
         await loadMesScheduleRuns();
+        await loadMesWorkplaceOperations();
         loadOperations();
         alert("Производственное задание убрано из списка");
       } catch (error) {
@@ -1387,7 +1459,12 @@ function App() {
         alert("Не удалось убрать производственное задание из списка");
       }
     },
-    [loadMesScheduleRuns, loadOperations, selectedMesRun]
+    [
+      loadMesScheduleRuns,
+      loadMesWorkplaceOperations,
+      loadOperations,
+      selectedMesRun,
+    ]
   );
 
   const handleShowMesRun = useCallback(
@@ -1410,6 +1487,7 @@ function App() {
         }
 
         await loadMesScheduleRuns();
+        await loadMesWorkplaceOperations();
         loadOperations();
         alert("Производственное задание добавлено в список");
       } catch (error) {
@@ -1417,7 +1495,7 @@ function App() {
         alert("Не удалось вернуть производственное задание в список");
       }
     },
-    [loadMesScheduleRuns, loadOperations]
+    [loadMesScheduleRuns, loadMesWorkplaceOperations, loadOperations]
   );
 
   const handleExcludeMesOrderItem = useCallback(
@@ -1445,13 +1523,19 @@ function App() {
 
         await handleOpenMesRun(runId);
         await loadMesScheduleRuns();
+        await loadMesWorkplaceOperations();
         loadOperations();
       } catch (error) {
         console.error("Ошибка исключения позиции из задания:", error);
         alert("Не удалось исключить позицию из задания");
       }
     },
-    [handleOpenMesRun, loadMesScheduleRuns, loadOperations]
+    [
+      handleOpenMesRun,
+      loadMesScheduleRuns,
+      loadMesWorkplaceOperations,
+      loadOperations,
+    ]
   );
 
   const handleIncludeMesOrderItem = useCallback(
@@ -1479,13 +1563,19 @@ function App() {
 
         await handleOpenMesRun(runId);
         await loadMesScheduleRuns();
+        await loadMesWorkplaceOperations();
         loadOperations();
       } catch (error) {
         console.error("Ошибка возврата позиции в задание:", error);
         alert("Не удалось вернуть позицию в задание");
       }
     },
-    [handleOpenMesRun, loadMesScheduleRuns, loadOperations]
+    [
+      handleOpenMesRun,
+      loadMesScheduleRuns,
+      loadMesWorkplaceOperations,
+      loadOperations,
+    ]
   );
 
   const handleStartMesOperation = useCallback(
@@ -1511,14 +1601,30 @@ function App() {
           await handleOpenMesRun(selectedMesRun.id);
         }
 
+        if (
+          selectedMesOperationCard &&
+          String(selectedMesOperationCard.id) === String(operationId) &&
+          data.operation
+        ) {
+          setSelectedMesOperationCard(data.operation);
+        }
+
         await loadMesScheduleRuns();
+        await loadMesWorkplaceOperations();
         loadOperations();
       } catch (error) {
         console.error("Ошибка старта операции:", error);
         alert("Не удалось начать операцию");
       }
     },
-    [handleOpenMesRun, loadMesScheduleRuns, loadOperations, selectedMesRun]
+    [
+      handleOpenMesRun,
+      loadMesScheduleRuns,
+      loadMesWorkplaceOperations,
+      loadOperations,
+      selectedMesOperationCard,
+      selectedMesRun,
+    ]
   );
 
   const handleOpenMesOperationReports = useCallback(async (operation) => {
@@ -1560,6 +1666,64 @@ function App() {
     setSelectedMesOperationForReports(null);
     setSelectedMesOperationReports([]);
   }, []);
+
+  const loadMesOperationCardReports = useCallback(async (operation) => {
+    if (!operation?.id) {
+      setMesOperationCardReports([]);
+      return;
+    }
+
+    setIsMesOperationCardReportsLoading(true);
+
+    try {
+      const res = await fetch(
+        `http://127.0.0.1:8000/mes/schedule_operations/${operation.id}/reports`
+      );
+      const data = await res.json();
+
+      if (!res.ok) {
+        const detail = data?.detail?.message || data?.detail;
+        alert(
+          "Не удалось загрузить журнал выполнения операции: " +
+            (detail || JSON.stringify(data))
+        );
+        return;
+      }
+
+      const reports = Array.isArray(data)
+        ? data
+        : Array.isArray(data.reports)
+        ? data.reports
+        : [];
+      setMesOperationCardReports(reports);
+    } catch (error) {
+      console.error("Ошибка загрузки журнала карточки операции:", error);
+      alert("Не удалось загрузить журнал выполнения операции");
+    } finally {
+      setIsMesOperationCardReportsLoading(false);
+    }
+  }, []);
+
+  const handleOpenMesOperationCard = useCallback((operation) => {
+    setSelectedMesOperationCard(operation);
+    setMesOperationCardTab("fact");
+    setMesOperationCardReports([]);
+  }, []);
+
+  const handleCloseMesOperationCard = useCallback(() => {
+    setSelectedMesOperationCard(null);
+    setMesOperationCardReports([]);
+  }, []);
+
+  useEffect(() => {
+    if (selectedMesOperationCard && mesOperationCardTab === "journal") {
+      loadMesOperationCardReports(selectedMesOperationCard);
+    }
+  }, [
+    loadMesOperationCardReports,
+    mesOperationCardTab,
+    selectedMesOperationCard,
+  ]);
 
   const handleLoadShiftReport = useCallback(async () => {
     const day = Number(shiftReportDay);
@@ -1682,9 +1846,26 @@ function App() {
         }
 
         await loadMesScheduleRuns();
+        await loadMesWorkplaceOperations();
         loadOperations();
+
+        if (
+          selectedMesOperationCard &&
+          String(selectedMesOperationCard.id) === String(operation.id) &&
+          data.operation
+        ) {
+          setSelectedMesOperationCard(data.operation);
+        }
+
         if (shouldRefreshReports) {
           await handleOpenMesOperationReports(data.operation || operation);
+        }
+        if (
+          selectedMesOperationCard &&
+          String(selectedMesOperationCard.id) === String(operation.id) &&
+          mesOperationCardTab === "journal"
+        ) {
+          await loadMesOperationCardReports(data.operation || operation);
         }
       } catch (error) {
         console.error("Ошибка фиксации выполнения:", error);
@@ -1694,8 +1875,12 @@ function App() {
     [
       handleOpenMesOperationReports,
       handleOpenMesRun,
+      loadMesOperationCardReports,
       loadMesScheduleRuns,
+      loadMesWorkplaceOperations,
       loadOperations,
+      mesOperationCardTab,
+      selectedMesOperationCard,
       selectedMesOperationForReports,
       selectedMesRun,
     ]
@@ -1787,6 +1972,12 @@ function App() {
 
         if (data.operation) {
           setSelectedMesOperationForReports(data.operation);
+          if (
+            selectedMesOperationCard &&
+            String(selectedMesOperationCard.id) === String(data.operation.id)
+          ) {
+            setSelectedMesOperationCard(data.operation);
+          }
         }
 
         if (selectedMesRun?.id) {
@@ -1794,11 +1985,20 @@ function App() {
         }
 
         await loadMesScheduleRuns();
+        await loadMesWorkplaceOperations();
         loadOperations();
 
         if (operationForReports?.id) {
           await handleOpenMesOperationReports(
             data.operation || operationForReports
+          );
+        }
+        if (
+          selectedMesOperationCard &&
+          mesOperationCardTab === "journal"
+        ) {
+          await loadMesOperationCardReports(
+            data.operation || selectedMesOperationCard
           );
         }
 
@@ -1813,8 +2013,12 @@ function App() {
     [
       handleOpenMesOperationReports,
       handleOpenMesRun,
+      loadMesOperationCardReports,
       loadMesScheduleRuns,
+      loadMesWorkplaceOperations,
       loadOperations,
+      mesOperationCardTab,
+      selectedMesOperationCard,
       selectedMesOperationForReports,
       selectedMesRun,
     ]
@@ -1885,6 +2089,47 @@ function App() {
       }),
     ]);
 
+  const mesWorkplaceGroups = [
+    {
+      key: "in_work",
+      title: "В работе",
+      operations: mesWorkplaceOperations.filter(
+        (operation) => operation.status === "in_work"
+      ),
+    },
+    {
+      key: "released",
+      title: "К выполнению",
+      operations: mesWorkplaceOperations.filter(
+        (operation) => operation.status === "released"
+      ),
+    },
+    {
+      key: "partially_completed",
+      title: "Частично выполнено",
+      operations: mesWorkplaceOperations.filter(
+        (operation) => operation.status === "partially_completed"
+      ),
+    },
+  ];
+  const hasMesWorkplaceOperations = mesWorkplaceGroups.some(
+    (group) => group.operations.length > 0
+  );
+  const productionCardReports = mesOperationCardReports.filter(
+    (report) => (report.report_type || "production") !== "correction"
+  );
+  const correctionCardReports = mesOperationCardReports.filter(
+    (report) => report.report_type === "correction"
+  );
+  const orphanCorrectionCardReports = correctionCardReports.filter(
+    (correction) =>
+      !productionCardReports.some(
+        (report) =>
+          String(report.id ?? report.report_id) ===
+          String(correction.corrected_report_id)
+      )
+  );
+
   return (
     <div style={{ padding: "20px" }}>
       <div style={{ display: "flex", gap: "8px", marginBottom: "12px" }}>
@@ -1918,7 +2163,7 @@ function App() {
       </div>
 
       {currentScreen === "aps" && (
-        <>
+        <div>
       <div
         style={{
           display: "flex",
@@ -2801,7 +3046,7 @@ function App() {
           </button>
         </div>
       )}
-        </>
+        </div>
       )}
 
       {currentScreen === "mes" && (
@@ -2813,6 +3058,38 @@ function App() {
           background: "#fafafa",
         }}
       >
+        <div
+          style={{
+            display: "flex",
+            gap: "8px",
+            marginBottom: "12px",
+            flexWrap: "wrap",
+          }}
+        >
+          {[
+            ["runs", "Производственные задания"],
+            ["workplace", "Рабочее место мастера"],
+            ["shiftReport", "Сменный отчёт"],
+          ].map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setMesScreen(key)}
+              style={{
+                padding: "7px 10px",
+                fontWeight: mesScreen === key ? "bold" : "normal",
+                border:
+                  mesScreen === key ? "2px solid #555" : "1px solid #ccc",
+                background: mesScreen === key ? "#f0f0f0" : "white",
+                cursor: "pointer",
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {mesScreen === "runs" && (
+          <div>
         <div
           style={{
             display: "flex",
@@ -3123,14 +3400,14 @@ function App() {
                                   {operation.id && (
                                     <button
                                       onClick={() =>
-                                        handleOpenMesOperationReports(operation)
+                                        handleOpenMesOperationCard(operation)
                                       }
                                       style={{
                                         padding: "4px 8px",
                                         cursor: "pointer",
                                       }}
                                     >
-                                      Журнал
+                                      Карточка
                                     </button>
                                   )}
 
@@ -3209,7 +3486,7 @@ function App() {
               </div>
             )}
 
-            {selectedMesOperationForReports && (
+            {false && selectedMesOperationForReports && (
               <div
                 style={{
                   marginTop: "16px",
@@ -3405,6 +3682,476 @@ function App() {
           </div>
         )}
 
+          </div>
+        )}
+        {selectedMesOperationCard && (
+          <div
+            style={{
+              marginTop: "16px",
+              border: "1px solid #bbb",
+              padding: "12px",
+              background: "#fff",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: "12px",
+                alignItems: "center",
+                marginBottom: "10px",
+              }}
+            >
+              <h3 style={{ margin: 0 }}>Карточка операции</h3>
+              <button
+                onClick={handleCloseMesOperationCard}
+                style={{ padding: "4px 8px", cursor: "pointer" }}
+              >
+                Закрыть
+              </button>
+            </div>
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                gap: "6px 16px",
+                marginBottom: "10px",
+                fontSize: "14px",
+              }}
+            >
+              <div><b>Задание:</b> #{selectedMesOperationCard.schedule_run_id}</div>
+              <div><b>Участок:</b> {selectedMesOperationCard.workshop_name || "Без участка"}</div>
+              <div><b>Ответственный:</b> {selectedMesOperationCard.responsible_name || ""}</div>
+              <div><b>Заказ:</b> {selectedMesOperationCard.order_no || ""}</div>
+              <div><b>Изделие / партия:</b> {selectedMesOperationCard.product_name || ""}</div>
+              <div>
+                <b>Операция:</b>{" "}
+                {selectedMesOperationCard.operation_name ||
+                  selectedMesOperationCard.operation_type ||
+                  ""}
+              </div>
+              <div>
+                <b>Станок:</b>{" "}
+                {selectedMesOperationCard.machine_name ||
+                  selectedMesOperationCard.machine_id ||
+                  ""}
+              </div>
+              <div>
+                <b>Статус:</b>{" "}
+                {MES_OPERATION_STATUS_LABELS[selectedMesOperationCard.status] ||
+                  selectedMesOperationCard.status ||
+                  ""}
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: "8px", marginBottom: "10px" }}>
+              <button
+                onClick={() => setMesOperationCardTab("fact")}
+                style={{
+                  padding: "6px 10px",
+                  fontWeight: mesOperationCardTab === "fact" ? "bold" : "normal",
+                  cursor: "pointer",
+                }}
+              >
+                Факт
+              </button>
+              <button
+                onClick={() => setMesOperationCardTab("journal")}
+                style={{
+                  padding: "6px 10px",
+                  fontWeight:
+                    mesOperationCardTab === "journal" ? "bold" : "normal",
+                  cursor: "pointer",
+                }}
+              >
+                Журнал
+              </button>
+            </div>
+
+            {mesOperationCardTab === "fact" && (
+              <div>
+                <div
+                  style={{
+                    display: "flex",
+                    gap: "16px",
+                    flexWrap: "wrap",
+                    marginBottom: "10px",
+                    padding: "8px",
+                    background: "#f7f7f7",
+                    border: "1px solid #ddd",
+                  }}
+                >
+                  <span>План: {Number(selectedMesOperationCard.quantity || 0)}</span>
+                  <span>
+                    Доступно:{" "}
+                    {Number(selectedMesOperationCard.available_quantity || 0)}
+                  </span>
+                  <span>Годно: {Number(selectedMesOperationCard.good_quantity || 0)}</span>
+                  <span>Брак: {Number(selectedMesOperationCard.defect_quantity || 0)}</span>
+                  <span>
+                    Остаток:{" "}
+                    {Math.max(
+                      Number(selectedMesOperationCard.quantity || 0) -
+                        Number(selectedMesOperationCard.good_quantity || 0),
+                      0
+                    )}
+                  </span>
+                </div>
+
+                <div style={{ marginBottom: "10px", fontSize: "14px" }}>
+                  <div>
+                    <b>Плановое начало:</b>{" "}
+                    {formatPlanMinute(selectedMesOperationCard.planned_start_time)}
+                  </div>
+                  <div>
+                    <b>Плановое окончание:</b>{" "}
+                    {formatPlanMinute(selectedMesOperationCard.planned_end_time)}
+                  </div>
+                  <div>
+                    <b>Факт начала:</b>{" "}
+                    {formatDateTime(selectedMesOperationCard.actual_start_at)}
+                  </div>
+                  <div>
+                    <b>Факт окончания:</b>{" "}
+                    {formatDateTime(selectedMesOperationCard.actual_end_at)}
+                  </div>
+                </div>
+
+                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                  {["released", "partially_completed"].includes(
+                    selectedMesOperationCard.status
+                  ) && (
+                    <button
+                      onClick={() =>
+                        handleStartMesOperation(selectedMesOperationCard.id)
+                      }
+                      style={{ padding: "6px 10px", cursor: "pointer" }}
+                    >
+                      Начать
+                    </button>
+                  )}
+                  {selectedMesOperationCard.status === "in_work" && (
+                    <button
+                      onClick={() =>
+                        handleCompleteMesOperation(selectedMesOperationCard)
+                      }
+                      style={{ padding: "6px 10px", cursor: "pointer" }}
+                    >
+                      Внести факт
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {mesOperationCardTab === "journal" && (
+              <div>
+                {isMesOperationCardReportsLoading ? (
+                  <div>Журнал загружается...</div>
+                ) : mesOperationCardReports.length === 0 ? (
+                  <div style={{ color: "#777" }}>
+                    По этой операции пока нет записей выполнения
+                  </div>
+                ) : (
+                  <div style={{ display: "grid", gap: "10px" }}>
+                    {productionCardReports.map((report, index) => {
+                      const reportId = report.id ?? report.report_id;
+                      const corrections = correctionCardReports.filter(
+                        (correction) =>
+                          String(correction.corrected_report_id) ===
+                          String(reportId)
+                      );
+                      const totalGood =
+                        Number(report.good_quantity || 0) +
+                        corrections.reduce(
+                          (sum, correction) =>
+                            sum + Number(correction.good_quantity || 0),
+                          0
+                        );
+                      const totalDefect =
+                        Number(report.defect_quantity || 0) +
+                        corrections.reduce(
+                          (sum, correction) =>
+                            sum + Number(correction.defect_quantity || 0),
+                          0
+                        );
+
+                      return (
+                        <div
+                          key={reportId || index}
+                          style={{
+                            border: "1px solid #ddd",
+                            padding: "10px",
+                            background: "#fff",
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              justifyContent: "space-between",
+                              gap: "10px",
+                              flexWrap: "wrap",
+                            }}
+                          >
+                            <strong>
+                              Выполнение #{reportId} · строка {index + 1}
+                            </strong>
+                            <button
+                              onClick={() => handleCorrectMesOperationReport(report)}
+                              style={{ padding: "4px 8px", cursor: "pointer" }}
+                            >
+                              Исправить
+                            </button>
+                          </div>
+                          <div>Начало: {formatDateTime(report.started_at)}</div>
+                          <div>Окончание: {formatDateTime(report.ended_at)}</div>
+                          <div>
+                            Введено: годно {Number(report.good_quantity || 0)},
+                            брак {Number(report.defect_quantity || 0)}
+                          </div>
+                          <div>Комментарий: {report.comment || ""}</div>
+                          {corrections.map((correction) => (
+                            <div
+                              key={correction.id ?? correction.report_id}
+                              style={{
+                                marginTop: "8px",
+                                marginLeft: "16px",
+                                padding: "8px",
+                                background: "#fff3cd",
+                                borderLeft: "4px solid #fb8c00",
+                              }}
+                            >
+                              <strong>
+                                Корректировка #{correction.id ?? correction.report_id}
+                              </strong>
+                              <div>
+                                Изменение: годно{" "}
+                                {Number(correction.good_quantity || 0)}, брак{" "}
+                                {Number(correction.defect_quantity || 0)}
+                              </div>
+                              <div>
+                                Причина: {correction.correction_reason || ""}
+                              </div>
+                              <div>
+                                Создано: {formatDateTime(correction.created_at)}
+                              </div>
+                            </div>
+                          ))}
+                          {corrections.length > 0 && (
+                            <div style={{ marginTop: "8px" }}>
+                              Итог после корректировок: годно {totalGood}, брак{" "}
+                              {totalDefect}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+
+                    {orphanCorrectionCardReports.length > 0 && (
+                      <div
+                        style={{
+                          border: "1px solid #ddd",
+                          padding: "10px",
+                          background: "#fff8e1",
+                        }}
+                      >
+                        <strong>Корректировки без исходной записи</strong>
+                        {orphanCorrectionCardReports.map((correction) => (
+                          <div key={correction.id ?? correction.report_id}>
+                            #{correction.id ?? correction.report_id}: годно{" "}
+                            {Number(correction.good_quantity || 0)}, брак{" "}
+                            {Number(correction.defect_quantity || 0)}. Причина:{" "}
+                            {correction.correction_reason || ""}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {mesScreen === "workplace" && (
+          <div>
+            <div
+              style={{
+                display: "flex",
+                gap: "8px",
+                alignItems: "center",
+                marginBottom: "12px",
+                flexWrap: "wrap",
+              }}
+            >
+              <h3 style={{ margin: 0 }}>Рабочее место мастера</h3>
+              <span>Участок:</span>
+              <select
+                value={selectedMesWorkshopId}
+                onChange={(e) => setSelectedMesWorkshopId(e.target.value)}
+                style={{ padding: "6px", minWidth: "180px" }}
+              >
+                <option value="">Все участки</option>
+                {mesWorkshops.map((workshop) => (
+                  <option key={workshop.id} value={String(workshop.id)}>
+                    {workshop.name}
+                    {workshop.responsible_name
+                      ? ` — ${workshop.responsible_name}`
+                      : ""}
+                  </option>
+                ))}
+              </select>
+              <button
+                onClick={loadMesWorkplaceOperations}
+                style={{ padding: "6px 10px", cursor: "pointer" }}
+              >
+                Обновить
+              </button>
+            </div>
+
+            {isMesWorkplaceLoading ? (
+              <div>Рабочее место загружается...</div>
+            ) : !hasMesWorkplaceOperations ? (
+              <div style={{ color: "#777" }}>
+                Для выбранного участка нет операций к выполнению
+              </div>
+            ) : (
+              mesWorkplaceGroups.map((group) =>
+                group.operations.length === 0 ? null : (
+                  <div key={group.key} style={{ marginBottom: "16px" }}>
+                    <h4 style={{ margin: "0 0 8px" }}>{group.title}</h4>
+                    <div style={{ overflowX: "auto" }}>
+                      <table
+                        style={{
+                          width: "100%",
+                          borderCollapse: "collapse",
+                          fontSize: "14px",
+                        }}
+                      >
+                        <thead>
+                          <tr>
+                            <th style={thStyle}>Задание</th>
+                            <th style={thStyle}>Заказ</th>
+                            <th style={thStyle}>Изделие / партия</th>
+                            <th style={thStyle}>Операция</th>
+                            <th style={thStyle}>Станок</th>
+                            <th style={thStyle}>План</th>
+                            <th style={thStyle}>Доступно</th>
+                            <th style={thStyle}>Годно</th>
+                            <th style={thStyle}>Брак</th>
+                            <th style={thStyle}>Остаток</th>
+                            <th style={thStyle}>Статус</th>
+                            <th style={thStyle}>Действие</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {group.operations.map((operation) => (
+                            <tr
+                              key={operation.id}
+                              style={getMesOperationRowStyle(operation.status)}
+                            >
+                              <td style={tdStyle}>#{operation.schedule_run_id}</td>
+                              <td style={tdStyle}>{operation.order_no || ""}</td>
+                              <td style={tdStyle}>
+                                {operation.product_name || ""}
+                              </td>
+                              <td style={tdStyle}>
+                                {operation.operation_name ||
+                                  operation.operation_type ||
+                                  ""}
+                              </td>
+                              <td style={tdStyle}>
+                                {operation.machine_name || operation.machine_id}
+                              </td>
+                              <td style={tdStyle}>
+                                {formatPlanInterval(
+                                  operation.planned_start_time,
+                                  operation.planned_end_time
+                                )}
+                              </td>
+                              <td style={tdStyle}>
+                                {Number(operation.available_quantity || 0)}
+                              </td>
+                              <td style={tdStyle}>
+                                {Number(operation.good_quantity || 0)}
+                              </td>
+                              <td style={tdStyle}>
+                                {Number(operation.defect_quantity || 0)}
+                              </td>
+                              <td style={tdStyle}>
+                                {Math.max(
+                                  Number(operation.quantity || 0) -
+                                    Number(operation.good_quantity || 0),
+                                  0
+                                )}
+                              </td>
+                              <td style={tdStyle}>
+                                {MES_OPERATION_STATUS_LABELS[operation.status] ||
+                                  operation.status}
+                              </td>
+                              <td style={tdStyle}>
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    gap: "6px",
+                                    flexWrap: "wrap",
+                                  }}
+                                >
+                                  {["released", "partially_completed"].includes(
+                                    operation.status
+                                  ) && (
+                                    <button
+                                      onClick={() =>
+                                        handleStartMesOperation(operation.id)
+                                      }
+                                      style={{
+                                        padding: "4px 8px",
+                                        cursor: "pointer",
+                                      }}
+                                    >
+                                      Начать
+                                    </button>
+                                  )}
+                                  {operation.status === "in_work" && (
+                                    <button
+                                      onClick={() =>
+                                        handleCompleteMesOperation(operation)
+                                      }
+                                      style={{
+                                        padding: "4px 8px",
+                                        cursor: "pointer",
+                                      }}
+                                    >
+                                      Внести факт
+                                    </button>
+                                  )}
+                                  <button
+                                    onClick={() =>
+                                      handleOpenMesOperationCard(operation)
+                                    }
+                                    style={{
+                                      padding: "4px 8px",
+                                      cursor: "pointer",
+                                    }}
+                                  >
+                                    Карточка
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )
+              )
+            )}
+          </div>
+        )}
+
+        {mesScreen === "shiftReport" && (
         <div
           style={{
             marginTop: "16px",
@@ -3585,6 +4332,7 @@ function App() {
             </div>
           ) : null}
         </div>
+        )}
       </div>
       )}
     </div>
