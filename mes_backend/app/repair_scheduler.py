@@ -2,7 +2,10 @@ from math import ceil
 
 from sqlalchemy import text
 
-from app.calendar_utils import build_work_intervals, is_inside_work_interval
+from app.calendar_utils import (
+    build_work_intervals,
+    is_inside_work_interval,
+)
 from app.models import PlanChangeLog
 
 
@@ -51,7 +54,7 @@ def _load_operations(db, plan_version_id):
                 oi.product_id,
                 m.group_id AS machine_group_id,
                 mgst.setup_team_id,
-                coalesce(mpr.setup_minutes, 0) AS setup_minutes,
+                coalesce(po.setup_minutes, mpr.setup_minutes, 0) AS setup_minutes,
                 mpr.units_per_minute
             FROM plan_operations po
             JOIN order_operations oo ON oo.id = po.operation_id
@@ -127,6 +130,16 @@ def _find_conflict_end(intervals, start, end, gap_after=0):
     ]
 
     return max(conflicting_ends) if conflicting_ends else None
+
+
+def _next_working_start(db, start):
+    candidate = int(start)
+    for _ in range(14 * 1440):
+        if is_inside_work_interval(db, candidate, candidate + 1):
+            return candidate
+        candidate += 1
+
+    raise RepairSchedulerError("Не удалось найти рабочее время смены для операции")
 
 
 def _build_busy_maps(operations, exclude_operation_id=None):
@@ -217,10 +230,7 @@ def _find_earliest_feasible_start(
                     candidate_start = setup_conflict_end
                     continue
 
-            if is_inside_work_interval(db, candidate_start, candidate_end):
-                return candidate_start
-
-            break
+            return candidate_start
 
     if blocked_by_setup_team:
         raise RepairSchedulerError("Нет свободного окна у бригады наладчиков")
@@ -228,7 +238,7 @@ def _find_earliest_feasible_start(
     if blocked_by_machine:
         raise RepairSchedulerError("Нет свободного окна на выбранном станке")
 
-    raise RepairSchedulerError("Операция не помещается в рабочий интервал смены")
+    raise RepairSchedulerError("Не удалось найти рабочее окно смены для операции")
 
 
 def _shift_operation(
@@ -253,7 +263,7 @@ def _shift_operation(
     old_machine_id = operation["machine_id"]
     old_start_time = operation["start_time"]
     old_end_time = operation["end_time"]
-    new_end = new_start + operation["duration_minutes"]
+    new_end = new_start + int(operation["duration_minutes"])
 
     db.execute(
         text(
@@ -323,18 +333,20 @@ def _validate_plan(db, operations):
                     )
             previous = operation
 
-    max_end_time = max((int(op["end_time"]) for op in operations), default=0)
-    work_intervals = build_work_intervals(db, max_end_time)
-
     for operation in operations:
         start_time = int(operation["start_time"])
         end_time = int(operation["end_time"])
 
-        if not any(
-            start_time >= interval_start and end_time <= interval_end
-            for interval_start, interval_end in work_intervals
-        ):
-            raise RepairSchedulerError("Операция выходит за рабочий интервал смены")
+        if end_time <= start_time:
+            raise RepairSchedulerError("Операция имеет некорректные границы времени")
+
+        if not is_inside_work_interval(db, start_time, end_time):
+            raise RepairSchedulerError("Операция начинается в нерабочее время")
+
+        if end_time - start_time != int(operation["duration_minutes"]):
+            raise RepairSchedulerError(
+                "Рабочая длительность операции меньше требуемой по норме"
+            )
 
     setup_intervals_by_team = {}
 

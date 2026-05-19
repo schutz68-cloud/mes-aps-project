@@ -23,12 +23,25 @@ const ORDER_COLORS = [
 const MES_SCHEDULE_STATUS_LABELS = {
   created: "создано",
   released: "выпущено",
+  in_work: "выполняется",
+  completed: "завершено",
+  cancelled: "отменено",
 };
 const MES_OPERATION_STATUS_LABELS = {
   planned: "запланировано",
   released: "выпущено",
+  in_work: "в работе",
+  partially_completed: "частично выполнено",
+  completed: "завершено",
   excluded: "исключено",
 };
+
+const MES_LOCKED_OPERATION_STATUSES = new Set([
+  "released",
+  "in_work",
+  "partially_completed",
+  "completed",
+]);
 
 function getOrderColors(orderId, isFrozen) {
   if (isFrozen) {
@@ -70,11 +83,33 @@ function buildMesTitle(op) {
   return `\nMES-задание #${op.mes_schedule_run_id}: ${scheduleStatus}, операция: ${operationStatus}`;
 }
 
-function isReleasedMesOperation(item) {
-  return (
-    item?.mes_schedule_status === "released" &&
-    item?.mes_operation_status === "released"
-  );
+function isLockedMesOperation(item) {
+  if (item?.mes_schedule_status === "cancelled") {
+    return false;
+  }
+
+  return MES_LOCKED_OPERATION_STATUSES.has(item?.mes_operation_status);
+}
+
+function buildSelectionClassName(baseClassName, opOrderItemId, selectedOrderItemId) {
+  const classes = String(baseClassName || "")
+    .split(" ")
+    .filter(
+      (name) =>
+        name &&
+        name !== "selected-order-item-operation" &&
+        name !== "dimmed-by-order-selection"
+    );
+
+  if (selectedOrderItemId && opOrderItemId) {
+    if (String(opOrderItemId) === String(selectedOrderItemId)) {
+      classes.push("selected-order-item-operation");
+    } else {
+      classes.push("dimmed-by-order-selection");
+    }
+  }
+
+  return classes.join(" ");
 }
 
 function getMachineGroupClass(machineGroupId) {
@@ -177,22 +212,47 @@ export default function Gantt({
   onMove,
   freezeHorizonMinutes,
   canEdit,
+  enableOrderSelection,
+  selectedOrderItemId,
+  onSelectOperation,
+  onClearSelection,
 }) {
   const containerRef = useRef(null);
   const timelineRef = useRef(null);
   const itemsRef = useRef(new DataSet([]));
   const groupsRef = useRef(new DataSet([]));
   const onMoveRef = useRef(onMove);
+  const selectedOrderItemIdRef = useRef(selectedOrderItemId);
+  const onSelectOperationRef = useRef(onSelectOperation);
+  const onClearSelectionRef = useRef(onClearSelection);
   const freezeHorizonRef = useRef(freezeHorizonMinutes ?? 0);
   const canEditRef = useRef(canEdit);
+  const enableOrderSelectionRef = useRef(enableOrderSelection);
+  const isMovingRef = useRef(false);
 
   useEffect(() => {
     onMoveRef.current = onMove;
   }, [onMove]);
 
   useEffect(() => {
+    selectedOrderItemIdRef.current = selectedOrderItemId;
+  }, [selectedOrderItemId]);
+
+  useEffect(() => {
+    onSelectOperationRef.current = onSelectOperation;
+  }, [onSelectOperation]);
+
+  useEffect(() => {
+    onClearSelectionRef.current = onClearSelection;
+  }, [onClearSelection]);
+
+  useEffect(() => {
     canEditRef.current = Boolean(canEdit);
   }, [canEdit]);
+
+  useEffect(() => {
+    enableOrderSelectionRef.current = Boolean(enableOrderSelection);
+  }, [enableOrderSelection]);
 
   useEffect(() => {
     if (!timelineRef.current) return;
@@ -219,6 +279,26 @@ export default function Gantt({
   }, [freezeHorizonMinutes]);
 
   useEffect(() => {
+    if (!itemsRef.current) return;
+
+    const updates = itemsRef.current
+      .get()
+      .filter((item) => item && item.type !== "background" && item.order_item_id)
+      .map((item) => ({
+        id: item.id,
+        className: buildSelectionClassName(
+          item.baseClassName,
+          item.order_item_id,
+          selectedOrderItemId
+        ),
+      }));
+
+    if (updates.length > 0) {
+      itemsRef.current.update(updates);
+    }
+  }, [selectedOrderItemId]);
+
+  useEffect(() => {
     if (!containerRef.current || timelineRef.current) return;
 
     const timeline = new Timeline(
@@ -242,6 +322,7 @@ export default function Gantt({
           return new Date(Math.round(date.getTime() / step) * step);
         },
         onMoving: (item, callback) => {
+          isMovingRef.current = true;
           const prev = itemsRef.current.get(item.id);
 
           if (!prev || String(item.id).startsWith("active-")) {
@@ -249,7 +330,7 @@ export default function Gantt({
             return;
           }
 
-          if (isReleasedMesOperation(prev)) {
+          if (isLockedMesOperation(prev)) {
             callback(prev);
             return;
           }
@@ -269,29 +350,43 @@ export default function Gantt({
           callback(item);
         },
         onMove: (item, callback) => {
+          isMovingRef.current = true;
+          const releaseMovingFlag = () => {
+            setTimeout(() => {
+              isMovingRef.current = false;
+            }, 0);
+          };
           const prev = itemsRef.current.get(item.id);
 
           if (String(item.id).startsWith("active-")) {
             callback(prev || null);
+            releaseMovingFlag();
             return;
           }
 
           if (!canEditRef.current) {
             callback(prev || null);
             alert("Редактировать можно только черновую версию плана");
+            releaseMovingFlag();
             return;
           }
 
           if (!prev) {
             callback(null);
+            releaseMovingFlag();
             return;
           }
 
-          if (isReleasedMesOperation(prev)) {
+          if (isLockedMesOperation(prev)) {
             callback(prev);
             alert(
-              `Операция уже выпущена в производственное задание №${prev.mes_schedule_run_id} и не может быть изменена в APS`
+              `Операция уже передана в MES или выполнена и не может быть изменена в APS${
+                prev.mes_schedule_run_id
+                  ? `: производственное задание №${prev.mes_schedule_run_id}`
+                  : ""
+              }`
             );
+            releaseMovingFlag();
             return;
           }
 
@@ -311,6 +406,7 @@ export default function Gantt({
               "Операция находится в замороженной зоне плана и не может быть перемещена"
             );
 
+            releaseMovingFlag();
             return;
           }
 
@@ -356,7 +452,8 @@ export default function Gantt({
                 "Нельзя переместить операцию: " +
                   (error?.message || "неизвестная ошибка")
               );
-            });
+            })
+            .finally(releaseMovingFlag);
         },
       }
     );
@@ -372,6 +469,32 @@ export default function Gantt({
     );
 
     timeline.on("click", (properties) => {
+      if (isMovingRef.current) {
+        isMovingRef.current = false;
+        return;
+      }
+
+      if (!enableOrderSelectionRef.current) {
+        return;
+      }
+
+      if (!properties?.item) {
+        onClearSelectionRef.current?.();
+        return;
+      }
+
+      if (properties?.item) {
+        const item = itemsRef.current.get(properties.item);
+
+        if (!item || String(properties.item).startsWith("bg-")) {
+          onClearSelectionRef.current?.();
+          return;
+        }
+
+        onSelectOperationRef.current?.(item);
+        return;
+      }
+
       if (!canEditRef.current && properties?.item) {
         alert("Редактировать можно только черновую версию плана");
       }
@@ -467,6 +590,21 @@ export default function Gantt({
         const start = Number(op.start);
         const end = Number(op.end);
         const machineOrderIndex = getMachineOrderIndex(op.machine);
+        const isMesCreated =
+          op.mes_schedule_status === "created" &&
+          op.mes_operation_status !== "excluded";
+        const isMesReleased = MES_LOCKED_OPERATION_STATUSES.has(
+          op.mes_operation_status
+        );
+        const isMesExcluded = op.mes_operation_status === "excluded";
+        const baseClassName = [
+          "active-overlay-operation",
+          isMesCreated ? "mes-created-operation" : "",
+          isMesReleased ? "mes-released-operation" : "",
+          isMesExcluded ? "mes-excluded-operation" : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
         setMachineGroups(
           groupMap,
           op.machine,
@@ -481,13 +619,29 @@ export default function Gantt({
           id: `active-${op.id}`,
           group: `${op.machine}::active`,
           machine: op.machine,
-          content: "",
-          title: buildActiveOverlayTitle(op, start, end),
+          content: op.mes_schedule_run_id ? "MES" : "",
+          title: `${buildActiveOverlayTitle(op, start, end)}${buildMesTitle(op)}`,
           start: start * 60000,
           end: end * 60000,
           type: "range",
           editable: false,
-          className: "active-overlay-operation",
+          baseClassName,
+          className: buildSelectionClassName(
+            baseClassName,
+            op.order_item_id,
+            selectedOrderItemIdRef.current
+          ),
+          mes_schedule_operation_id: op.mes_schedule_operation_id,
+          order_item_id: op.order_item_id,
+          order_id: op.order_id,
+          order_no: op.order_no,
+          product_name: op.product_name,
+          quantity: op.quantity,
+          operation_name: op.operation_name,
+          operation_type: op.operation_type,
+          mes_schedule_run_id: op.mes_schedule_run_id,
+          mes_schedule_status: op.mes_schedule_status,
+          mes_operation_status: op.mes_operation_status,
         });
       }
     }
@@ -505,10 +659,20 @@ export default function Gantt({
       const isMesCreated =
         op.mes_schedule_status === "created" &&
         op.mes_operation_status !== "excluded";
-      const isMesReleased =
-        op.mes_schedule_status === "released" &&
-        op.mes_operation_status === "released";
+      const isMesReleased = MES_LOCKED_OPERATION_STATUSES.has(
+        op.mes_operation_status
+      );
       const isMesExcluded = op.mes_operation_status === "excluded";
+      const baseClassName = [
+        isFrozen ? "frozen-operation" : "normal-operation",
+        isMesCreated ? "mes-created-operation" : "",
+        isMesReleased ? "mes-released-operation" : "",
+        isMesExcluded ? "mes-excluded-operation" : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+      const setupTitlePart =
+        setupMinutes > 0 ? `РЅР°Р»Р°РґРєР° ${setupMinutes} РјРёРЅ., ` : "";
       const baseTitle = `${
         op.operation_name || op.operation_type || ""
       }, наладка ${setupMinutes} мин., выполнение ${runMinutes} мин.`;
@@ -530,20 +694,30 @@ export default function Gantt({
         content: `${op.label || String(op.id)}${
           op.mes_schedule_run_id ? " · MES" : ""
         }`,
-        title: `${baseTitle}${buildMesTitle(op)}`,
+        title: `${
+          setupMinutes > 0
+            ? baseTitle
+            : `${op.operation_name || op.operation_type || ""}, выполнение ${runMinutes} мин.`
+        }${buildMesTitle(op)}`,
         start: start * 60000,
         end: end * 60000,
         type: "range",
         style: `background: linear-gradient(to right, ${colors.setup} 0%, ${colors.setup} ${setupPercent}%, ${colors.work} ${setupPercent}%, ${colors.work} 100%); border-color: ${colors.border};`,
-        className: [
-          isFrozen ? "frozen-operation" : "normal-operation",
-          isMesCreated ? "mes-created-operation" : "",
-          isMesReleased ? "mes-released-operation" : "",
-          isMesExcluded ? "mes-excluded-operation" : "",
-        ]
-          .filter(Boolean)
-          .join(" "),
+        baseClassName,
+        className: buildSelectionClassName(
+          baseClassName,
+          op.order_item_id,
+          selectedOrderItemIdRef.current
+        ),
+        order_item_id: op.order_item_id,
+        order_id: op.order_id,
+        order_no: op.order_no,
+        product_name: op.product_name,
+        quantity: op.quantity,
+        operation_name: op.operation_name,
+        operation_type: op.operation_type,
         mes_schedule_run_id: op.mes_schedule_run_id,
+        mes_schedule_operation_id: op.mes_schedule_operation_id,
         mes_schedule_status: op.mes_schedule_status,
         mes_operation_status: op.mes_operation_status,
       });
@@ -727,6 +901,20 @@ export default function Gantt({
 
           .vis-item.mes-excluded-operation {
             opacity: 0.55;
+          }
+
+          .vis-item.dimmed-by-order-selection {
+            opacity: 0.25;
+          }
+
+          .vis-item.selected-order-item-operation {
+            opacity: 1;
+            filter: saturate(1.2) brightness(1.04);
+            z-index: 20;
+          }
+
+          .vis-item.selected-order-item-operation.vis-selected {
+            filter: saturate(1.2) brightness(1.04);
           }
 
           .vis-custom-time {

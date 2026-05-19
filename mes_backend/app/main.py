@@ -3,13 +3,14 @@ from pydantic import BaseModel
 from typing import Optional
 from uuid import uuid4
 from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, date, time, timedelta
 from app.calendar_utils import (
     build_non_working_intervals,
-    build_work_intervals,
     is_inside_work_interval,
 )
 from app.db import SessionLocal, init_db_schema
 from app.models import (
+    MesOperationReport,
     MesScheduleOperation,
     MesScheduleRun,
     PlanOperation,
@@ -55,6 +56,18 @@ class MesScheduleRunCreatePayload(BaseModel):
     start_minute: Optional[int] = None
     end_minute: Optional[int] = None
     description: Optional[str] = None
+
+
+class MesOperationCompletePayload(BaseModel):
+    good_quantity: int
+    defect_quantity: int = 0
+    comment: Optional[str] = None
+
+
+class MesOperationReportCorrectionPayload(BaseModel):
+    good_quantity: int
+    defect_quantity: int = 0
+    reason: str
 
 
 # ======================
@@ -158,7 +171,7 @@ def _row_value(row, key):
     if hasattr(row, "_mapping"):
         return row._mapping.get(key)
 
-    return getattr(row, key)
+    return getattr(row, key, None)
 
 
 def serialize_mes_schedule_run(run):
@@ -192,6 +205,16 @@ def serialize_mes_schedule_run(run):
 
 
 def serialize_mes_schedule_operation(row):
+    good_quantity = int(_row_value(row, "good_quantity") or 0)
+    defect_quantity = int(_row_value(row, "defect_quantity") or 0)
+    quantity = int(_row_value(row, "quantity") or 0)
+    remaining_quantity = max(quantity - good_quantity, 0)
+    completion_percent = (
+        round((good_quantity / quantity) * 100, 1)
+        if quantity > 0
+        else 0
+    )
+
     return {
         "id": _row_value(row, "id"),
         "schedule_run_id": _row_value(row, "schedule_run_id"),
@@ -207,12 +230,91 @@ def serialize_mes_schedule_operation(row):
         "machine_group_id": _row_value(row, "machine_group_id"),
         "operation_type": _row_value(row, "operation_type"),
         "operation_name": _row_value(row, "operation_name"),
-        "quantity": _row_value(row, "quantity"),
+        "quantity": quantity,
         "setup_minutes": _row_value(row, "setup_minutes"),
         "planned_start_time": _row_value(row, "planned_start_time"),
         "planned_end_time": _row_value(row, "planned_end_time"),
         "status": _row_value(row, "status"),
+        "actual_start_at": (
+            _row_value(row, "actual_start_at").isoformat()
+            if _row_value(row, "actual_start_at")
+            else None
+        ),
+        "actual_end_at": (
+            _row_value(row, "actual_end_at").isoformat()
+            if _row_value(row, "actual_end_at")
+            else None
+        ),
+        "good_quantity": good_quantity,
+        "defect_quantity": defect_quantity,
+        "actual_comment": _row_value(row, "actual_comment"),
+        "remaining_quantity": remaining_quantity,
+        "completion_percent": completion_percent,
+        "workshop_id": _row_value(row, "workshop_id"),
+        "workshop_code": _row_value(row, "workshop_code"),
+        "workshop_name": _row_value(row, "workshop_name") or "Без участка",
+        "responsible_name": _row_value(row, "responsible_name"),
     }
+
+
+def serialize_mes_operation_report(row):
+    return {
+        "id": _row_value(row, "id"),
+        "mes_schedule_operation_id": _row_value(row, "mes_schedule_operation_id"),
+        "started_at": (
+            _row_value(row, "started_at").isoformat()
+            if _row_value(row, "started_at")
+            else None
+        ),
+        "ended_at": (
+            _row_value(row, "ended_at").isoformat()
+            if _row_value(row, "ended_at")
+            else None
+        ),
+        "good_quantity": int(_row_value(row, "good_quantity") or 0),
+        "defect_quantity": int(_row_value(row, "defect_quantity") or 0),
+        "comment": _row_value(row, "comment"),
+        "reported_by": _row_value(row, "reported_by"),
+        "report_type": _row_value(row, "report_type") or "production",
+        "corrected_report_id": _row_value(row, "corrected_report_id"),
+        "correction_reason": _row_value(row, "correction_reason"),
+        "created_at": (
+            _row_value(row, "created_at").isoformat()
+            if _row_value(row, "created_at")
+            else None
+        ),
+    }
+
+
+def _datetime_to_iso(value):
+    return value.isoformat() if value else None
+
+
+def resolve_shift_report_period(day: int, shift: int):
+    if day < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="День сменного отчёта должен быть больше нуля",
+        )
+
+    if shift not in {1, 2}:
+        raise HTTPException(
+            status_code=400,
+            detail="Номер смены должен быть 1 или 2",
+        )
+
+    report_date = date.today() + timedelta(days=day - 1)
+
+    if shift == 1:
+        shift_start = datetime.combine(report_date, time(hour=8))
+        shift_end = datetime.combine(report_date, time(hour=19))
+        shift_name = "Смена 1"
+    else:
+        shift_start = datetime.combine(report_date, time(hour=20))
+        shift_end = datetime.combine(report_date + timedelta(days=1), time(hour=7))
+        shift_name = "Смена 2"
+
+    return shift_name, shift_start, shift_end
 
 
 def resolve_mes_schedule_period(payload: MesScheduleRunCreatePayload):
@@ -261,6 +363,80 @@ def get_mes_schedule_run_or_404(db, run_id: int) -> MesScheduleRun:
     return run
 
 
+def get_mes_schedule_operation_or_404(db, operation_id: int) -> MesScheduleOperation:
+    operation = (
+        db.query(MesScheduleOperation)
+        .filter(MesScheduleOperation.id == operation_id)
+        .first()
+    )
+
+    if not operation:
+        raise HTTPException(status_code=404, detail="MES-операция не найдена")
+
+    return operation
+
+
+def calculate_mes_operation_available_quantity(db, mes_operation) -> int:
+    current_processed = int(_row_value(mes_operation, "good_quantity") or 0) + int(
+        _row_value(mes_operation, "defect_quantity") or 0
+    )
+    quantity = int(_row_value(mes_operation, "quantity") or 0)
+    operation_id = _row_value(mes_operation, "operation_id")
+    schedule_run_id = _row_value(mes_operation, "schedule_run_id")
+    order_item_id = _row_value(mes_operation, "order_item_id")
+
+    current_sequence = db.execute(
+        text(
+            """
+            SELECT sequence_no
+            FROM order_operations
+            WHERE id = :operation_id
+            """
+        ),
+        {"operation_id": operation_id},
+    ).scalar()
+
+    if current_sequence is None:
+        return max(quantity - current_processed, 0)
+
+    previous_operation = db.execute(
+        text(
+            """
+            SELECT
+                mso.id,
+                mso.good_quantity,
+                mso.defect_quantity,
+                oo.sequence_no
+            FROM mes_schedule_operations mso
+            JOIN order_operations oo ON oo.id = mso.operation_id
+            WHERE mso.schedule_run_id = :schedule_run_id
+              AND mso.order_item_id = :order_item_id
+              AND oo.sequence_no < :current_sequence_no
+              AND mso.status <> 'excluded'
+            ORDER BY oo.sequence_no DESC, mso.id DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "schedule_run_id": schedule_run_id,
+            "order_item_id": order_item_id,
+            "current_sequence_no": current_sequence,
+        },
+    ).mappings().first()
+
+    if not previous_operation:
+        return max(quantity - current_processed, 0)
+
+    previous_good = int(previous_operation["good_quantity"] or 0)
+    return max(previous_good - current_processed, 0)
+
+
+def serialize_mes_schedule_operation_for_response(db, row):
+    result = serialize_mes_schedule_operation(row)
+    result["available_quantity"] = calculate_mes_operation_available_quantity(db, row)
+    return result
+
+
 def assert_mes_schedule_run_composition_editable(run: MesScheduleRun):
     if run.status == "released":
         raise HTTPException(
@@ -278,6 +454,136 @@ def assert_mes_schedule_run_composition_editable(run: MesScheduleRun):
         raise HTTPException(
             status_code=409,
             detail="Изменять состав можно только у созданного задания",
+        )
+
+
+def refresh_mes_schedule_run_status(db, run_id: int):
+    run = get_mes_schedule_run_or_404(db, run_id)
+
+    if run.status in {"cancelled"}:
+        return run
+
+    statuses = [
+        row["status"]
+        for row in db.execute(
+            text(
+                """
+                SELECT status
+                FROM mes_schedule_operations
+                WHERE schedule_run_id = :run_id
+                  AND status <> 'excluded'
+                """
+            ),
+            {"run_id": run_id},
+        ).mappings().all()
+    ]
+
+    if not statuses:
+        return run
+
+    if any(status == "in_work" for status in statuses):
+        run.status = "in_work"
+    elif any(status == "partially_completed" for status in statuses):
+        run.status = "in_work"
+    elif all(status == "completed" for status in statuses):
+        run.status = "completed"
+    elif any(status == "released" for status in statuses):
+        run.status = "released"
+
+    return run
+
+
+def refresh_mes_operation_actuals(db, mes_operation_id: int):
+    operation = get_mes_schedule_operation_or_404(db, mes_operation_id)
+    totals = db.execute(
+        text(
+            """
+            SELECT
+                COALESCE(SUM(good_quantity), 0) AS total_good,
+                COALESCE(SUM(defect_quantity), 0) AS total_defect,
+                MIN(started_at) AS first_start,
+                MAX(ended_at) AS last_end
+            FROM mes_operation_reports
+            WHERE mes_schedule_operation_id = :operation_id
+            """
+        ),
+        {"operation_id": mes_operation_id},
+    ).mappings().first()
+
+    total_good = int(totals["total_good"] or 0)
+    total_defect = int(totals["total_defect"] or 0)
+    planned_quantity = int(operation.quantity or 0)
+
+    operation.good_quantity = total_good
+    operation.defect_quantity = total_defect
+    operation.actual_start_at = totals["first_start"]
+    operation.actual_end_at = totals["last_end"]
+
+    if planned_quantity > 0 and total_good >= planned_quantity:
+        operation.status = "completed"
+    elif total_good > 0 or total_defect > 0:
+        operation.status = "partially_completed"
+    elif operation.status in {"completed", "partially_completed"}:
+        operation.status = "released"
+
+    return operation
+
+
+def assert_mes_correction_does_not_overconsume_next(
+    db,
+    operation: MesScheduleOperation,
+    new_total_good: int,
+):
+    current_sequence = db.execute(
+        text(
+            """
+            SELECT sequence_no
+            FROM order_operations
+            WHERE id = :operation_id
+            """
+        ),
+        {"operation_id": operation.operation_id},
+    ).scalar()
+
+    if current_sequence is None:
+        return
+
+    next_operation = db.execute(
+        text(
+            """
+            SELECT
+                mso.id,
+                mso.good_quantity,
+                mso.defect_quantity,
+                oo.sequence_no
+            FROM mes_schedule_operations mso
+            JOIN order_operations oo ON oo.id = mso.operation_id
+            WHERE mso.schedule_run_id = :schedule_run_id
+              AND mso.order_item_id = :order_item_id
+              AND oo.sequence_no > :current_sequence_no
+              AND mso.status <> 'excluded'
+            ORDER BY oo.sequence_no ASC, mso.id ASC
+            LIMIT 1
+            """
+        ),
+        {
+            "schedule_run_id": operation.schedule_run_id,
+            "order_item_id": operation.order_item_id,
+            "current_sequence_no": current_sequence,
+        },
+    ).mappings().first()
+
+    if not next_operation:
+        return
+
+    next_processed = int(next_operation["good_quantity"] or 0) + int(
+        next_operation["defect_quantity"] or 0
+    )
+
+    if next_processed > new_total_good:
+        raise HTTPException(
+            status_code=409,
+            detail="Корректировка невозможна: следующая операция уже обработала больше доступного количества",
         )
 
 
@@ -416,7 +722,7 @@ def validate_plan_version(db, plan_version_id: int) -> dict:
                     m.name AS machine_name,
 
                     mpr.units_per_minute,
-                    COALESCE(mpr.setup_minutes, 0) AS setup_minutes
+                    COALESCE(po.setup_minutes, mpr.setup_minutes, 0) AS setup_minutes
                 FROM plan_operations po
                 LEFT JOIN order_operations oo
                   ON oo.id = po.operation_id
@@ -545,12 +851,14 @@ def validate_plan_version(db, plan_version_id: int) -> dict:
             expected_duration = ceil(
                 int(row["quantity"]) / float(row["units_per_minute"])
             ) + int(row["setup_minutes"] or 0)
-            actual_duration = int(row["end_time"]) - int(row["start_time"])
+            start_time = int(row["start_time"])
+            end_time = int(row["end_time"])
+            actual_duration = end_time - start_time
 
             if actual_duration != expected_duration:
                 add_error(
                     "duration_error",
-                    "Длительность операции не соответствует норме",
+                    "Рабочая длительность операции меньше нормы",
                     row,
                     {
                         "expected_duration": expected_duration,
@@ -667,21 +975,27 @@ def validate_plan_version(db, plan_version_id: int) -> dict:
                     )
             previous = row
 
-    max_end_time = max((int(row["end_time"]) for row in valid_machine_rows), default=0)
-    work_intervals = build_work_intervals(db, max_end_time)
-
     for row in valid_machine_rows:
         start_time = int(row["start_time"])
         end_time = int(row["end_time"])
-        is_inside_work_interval = any(
-            start_time >= interval_start and end_time <= interval_end
-            for interval_start, interval_end in work_intervals
-        )
 
-        if not is_inside_work_interval:
+        if end_time <= start_time:
             add_error(
                 "operation_calendar_error",
-                "Операция выходит за рабочий интервал смены",
+                "Операция имеет некорректные границы времени",
+                row,
+                {
+                    "start_time": start_time,
+                    "end_time": end_time,
+                },
+                "calendar_errors",
+            )
+            continue
+
+        if not is_inside_work_interval(db, start_time, end_time):
+            add_error(
+                "operation_calendar_error",
+                "Операция начинается в нерабочее время",
                 row,
                 {
                     "start_time": start_time,
@@ -938,6 +1252,53 @@ def get_calendar_non_working_intervals(
 # ======================
 # MES SCHEDULE RUNS
 # ======================
+@app.get("/mes/workshops")
+def list_mes_workshops():
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT
+                    w.id,
+                    w.code,
+                    w.name,
+                    w.responsible_name,
+                    w.sort_order,
+                    COALESCE(
+                        array_agg(wmg.machine_group_id ORDER BY wmg.machine_group_id)
+                            FILTER (WHERE wmg.machine_group_id IS NOT NULL),
+                        ARRAY[]::text[]
+                    ) AS machine_groups
+                FROM workshops w
+                LEFT JOIN workshop_machine_groups wmg
+                  ON wmg.workshop_id = w.id
+                GROUP BY
+                    w.id,
+                    w.code,
+                    w.name,
+                    w.responsible_name,
+                    w.sort_order
+                ORDER BY w.sort_order ASC, w.name ASC
+                """
+            )
+        ).mappings().all()
+
+        return [
+            {
+                "id": row["id"],
+                "code": row["code"],
+                "name": row["name"],
+                "responsible_name": row["responsible_name"],
+                "machine_groups": list(row["machine_groups"] or []),
+                "sort_order": row["sort_order"],
+            }
+            for row in rows
+        ]
+    finally:
+        db.close()
+
+
 @app.get("/mes/schedule_runs")
 def list_mes_schedule_runs(include_hidden: bool = False):
     db = SessionLocal()
@@ -1065,7 +1426,7 @@ def create_mes_schedule_run_from_active(payload: MesScheduleRunCreatePayload):
                     po.id,
                     po.operation_id,
                     oi.order_id,
-                    oo.order_item_id,
+                    oi.id,
                     oi.product_id,
                     p.name,
                     o.order_no,
@@ -1075,7 +1436,7 @@ def create_mes_schedule_run_from_active(payload: MesScheduleRunCreatePayload):
                     oo.operation_type,
                     ro.operation_name,
                     oo.quantity,
-                    COALESCE(mpr.setup_minutes, 0),
+                    COALESCE(po.setup_minutes, mpr.setup_minutes, 0),
                     po.start_time,
                     po.end_time,
                     'planned'
@@ -1131,20 +1492,31 @@ def get_mes_schedule_run(run_id: int):
     db = SessionLocal()
     try:
         run = get_mes_schedule_run_or_404(db, run_id)
-        operations = (
-            db.query(MesScheduleOperation)
-            .filter(MesScheduleOperation.schedule_run_id == run_id)
-            .order_by(
-                MesScheduleOperation.planned_start_time,
-                MesScheduleOperation.id,
-            )
-            .all()
-        )
+        operations = db.execute(
+            text(
+                """
+                SELECT
+                    mso.*,
+                    w.id AS workshop_id,
+                    w.code AS workshop_code,
+                    COALESCE(w.name, 'Без участка') AS workshop_name,
+                    w.responsible_name
+                FROM mes_schedule_operations mso
+                LEFT JOIN workshop_machine_groups wmg
+                  ON wmg.machine_group_id = mso.machine_group_id
+                LEFT JOIN workshops w
+                  ON w.id = wmg.workshop_id
+                WHERE mso.schedule_run_id = :run_id
+                ORDER BY mso.planned_start_time, mso.id
+                """
+            ),
+            {"run_id": run_id},
+        ).mappings().all()
 
         return {
             "run": serialize_mes_schedule_run(run),
             "operations": [
-                serialize_mes_schedule_operation(operation)
+                serialize_mes_schedule_operation_for_response(db, operation)
                 for operation in operations
             ],
         }
@@ -1174,6 +1546,19 @@ def release_mes_schedule_run(run_id: int):
             raise HTTPException(
                 status_code=409,
                 detail="В производство можно выпустить только созданное задание",
+            )
+
+        operations_to_release = (
+            db.query(MesScheduleOperation)
+            .filter(MesScheduleOperation.schedule_run_id == run_id)
+            .filter(MesScheduleOperation.status == "planned")
+            .count()
+        )
+
+        if operations_to_release == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Нельзя выпустить производственное задание: нет операций к выполнению",
             )
 
         run.status = "released"
@@ -1315,6 +1700,489 @@ def show_mes_schedule_run(run_id: int):
             status_code=500,
             detail=f"Не удалось вернуть производственное задание в список: {error}",
         )
+    finally:
+        db.close()
+
+
+@app.post("/mes/schedule_operations/{operation_id}/start")
+def start_mes_schedule_operation(operation_id: int):
+    db = SessionLocal()
+    try:
+        operation = get_mes_schedule_operation_or_404(db, operation_id)
+        run = get_mes_schedule_run_or_404(db, operation.schedule_run_id)
+
+        if run.status not in {"released", "in_work"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Операцию можно начать только в выпущенном производственном задании",
+            )
+
+        if operation.status == "excluded":
+            raise HTTPException(status_code=409, detail="Исключённую операцию нельзя начать")
+
+        if operation.status == "completed":
+            raise HTTPException(
+                status_code=409,
+                detail="Завершённую операцию нельзя начать повторно",
+            )
+
+        if operation.status == "in_work":
+            raise HTTPException(status_code=409, detail="Операция уже находится в работе")
+
+        if operation.status not in {"released", "partially_completed"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Начать можно только выпущенную или частично выполненную операцию",
+            )
+
+        machine_busy = (
+            db.query(MesScheduleOperation)
+            .filter(MesScheduleOperation.machine_id == operation.machine_id)
+            .filter(MesScheduleOperation.status == "in_work")
+            .filter(MesScheduleOperation.id != operation.id)
+            .first()
+        )
+
+        if machine_busy:
+            raise HTTPException(
+                status_code=409,
+                detail="На этом станке уже выполняется другая операция",
+            )
+
+        available_quantity = calculate_mes_operation_available_quantity(db, operation)
+
+        if available_quantity <= 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Нет доступного количества для запуска операции. Сначала зафиксируйте годное количество на предыдущей операции",
+            )
+
+        operation.status = "in_work"
+        operation.actual_end_at = None
+        if not operation.actual_start_at:
+            db.execute(
+                text(
+                    """
+                    UPDATE mes_schedule_operations
+                    SET actual_start_at = now()
+                    WHERE id = :operation_id
+                    """
+                ),
+                {"operation_id": operation.id},
+            )
+
+        if run.status == "released":
+            run.status = "in_work"
+
+        db.commit()
+        db.refresh(operation)
+
+        return {
+            "status": "ok",
+            "operation": serialize_mes_schedule_operation_for_response(db, operation),
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось начать операцию: {error}",
+        )
+    finally:
+        db.close()
+
+
+@app.post("/mes/schedule_operations/{operation_id}/complete")
+def complete_mes_schedule_operation(
+    operation_id: int,
+    payload: MesOperationCompletePayload,
+):
+    db = SessionLocal()
+    try:
+        operation = get_mes_schedule_operation_or_404(db, operation_id)
+        get_mes_schedule_run_or_404(db, operation.schedule_run_id)
+
+        if operation.status != "in_work":
+            raise HTTPException(
+                status_code=409,
+                detail="Фиксировать выполнение можно только для операции в работе",
+            )
+
+        good_quantity = int(payload.good_quantity)
+        defect_quantity = int(payload.defect_quantity or 0)
+
+        if (
+            good_quantity < 0
+            or defect_quantity < 0
+            or good_quantity + defect_quantity <= 0
+        ):
+            raise HTTPException(status_code=400, detail="Количество должно быть положительным")
+
+        comment = (payload.comment or "").strip() or None
+        available_quantity = calculate_mes_operation_available_quantity(db, operation)
+        reported_quantity = good_quantity + defect_quantity
+
+        if reported_quantity > available_quantity:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Нельзя зафиксировать выполнение больше доступного "
+                    f"количества. Доступно: {available_quantity}"
+                ),
+            )
+
+        db.add(
+            MesOperationReport(
+                mes_schedule_operation_id=operation.id,
+                started_at=operation.actual_start_at,
+                good_quantity=good_quantity,
+                defect_quantity=defect_quantity,
+                comment=comment,
+                reported_by="system",
+                report_type="production",
+            )
+        )
+        db.flush()
+        operation.actual_comment = comment
+
+        db.execute(
+            text(
+                """
+                UPDATE mes_schedule_operations
+                SET actual_end_at = now()
+                WHERE id = :operation_id
+                """
+            ),
+            {"operation_id": operation.id},
+        )
+        db.execute(
+            text(
+                """
+                UPDATE mes_operation_reports
+                SET ended_at = now()
+                WHERE mes_schedule_operation_id = :operation_id
+                  AND ended_at IS NULL
+                """
+            ),
+            {"operation_id": operation.id},
+        )
+
+        operation = refresh_mes_operation_actuals(db, operation.id)
+        refresh_mes_schedule_run_status(db, operation.schedule_run_id)
+        db.commit()
+        db.refresh(operation)
+
+        return {
+            "status": "ok",
+            "operation": serialize_mes_schedule_operation_for_response(db, operation),
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось зафиксировать выполнение операции: {error}",
+        )
+    finally:
+        db.close()
+
+
+@app.post("/mes/operation_reports/{report_id}/correct")
+def correct_mes_operation_report(
+    report_id: int,
+    payload: MesOperationReportCorrectionPayload,
+):
+    db = SessionLocal()
+    try:
+        old_report = (
+            db.query(MesOperationReport)
+            .filter(MesOperationReport.id == report_id)
+            .first()
+        )
+
+        if not old_report:
+            raise HTTPException(status_code=404, detail="Запись выполнения не найдена")
+
+        if (old_report.report_type or "production") == "correction":
+            raise HTTPException(
+                status_code=409,
+                detail="Корректирующую запись нельзя корректировать повторно",
+            )
+
+        operation = get_mes_schedule_operation_or_404(
+            db,
+            old_report.mes_schedule_operation_id,
+        )
+
+        good_quantity = int(payload.good_quantity)
+        defect_quantity = int(payload.defect_quantity or 0)
+        reason = (payload.reason or "").strip()
+
+        if good_quantity < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Годное количество не может быть отрицательным",
+            )
+
+        if defect_quantity < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Количество брака не может быть отрицательным",
+            )
+
+        if not reason:
+            raise HTTPException(status_code=400, detail="Укажите причину исправления")
+
+        previous_corrections = db.execute(
+            text(
+                """
+                SELECT
+                    COALESCE(SUM(good_quantity), 0) AS good_quantity,
+                    COALESCE(SUM(defect_quantity), 0) AS defect_quantity
+                FROM mes_operation_reports
+                WHERE corrected_report_id = :report_id
+                  AND report_type = 'correction'
+                """
+            ),
+            {"report_id": old_report.id},
+        ).mappings().first()
+
+        current_report_good = int(old_report.good_quantity or 0) + int(
+            previous_corrections["good_quantity"] or 0
+        )
+        current_report_defect = int(old_report.defect_quantity or 0) + int(
+            previous_corrections["defect_quantity"] or 0
+        )
+        delta_good = good_quantity - current_report_good
+        delta_defect = defect_quantity - current_report_defect
+
+        if delta_good == 0 and delta_defect == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Новые значения совпадают с исходными",
+            )
+
+        new_total_good = int(operation.good_quantity or 0) + delta_good
+        new_total_defect = int(operation.defect_quantity or 0) + delta_defect
+
+        if new_total_good < 0 or new_total_defect < 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Корректировка приводит к отрицательному итогу по операции",
+            )
+
+        if delta_good < 0:
+            assert_mes_correction_does_not_overconsume_next(
+                db,
+                operation,
+                new_total_good,
+            )
+
+        correction = MesOperationReport(
+            mes_schedule_operation_id=old_report.mes_schedule_operation_id,
+            started_at=old_report.started_at,
+            ended_at=datetime.utcnow(),
+            good_quantity=delta_good,
+            defect_quantity=delta_defect,
+            comment=f"Корректировка отчёта #{old_report.id}",
+            reported_by="system",
+            report_type="correction",
+            corrected_report_id=old_report.id,
+            correction_reason=reason,
+        )
+        db.add(correction)
+        db.flush()
+
+        operation = refresh_mes_operation_actuals(db, operation.id)
+        refresh_mes_schedule_run_status(db, operation.schedule_run_id)
+        db.commit()
+        db.refresh(operation)
+        db.refresh(correction)
+
+        return {
+            "status": "ok",
+            "operation": serialize_mes_schedule_operation_for_response(db, operation),
+            "report": serialize_mes_operation_report(correction),
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось выполнить корректировку факта: {error}",
+        )
+    finally:
+        db.close()
+
+
+@app.get("/mes/schedule_operations/{operation_id}/reports")
+def get_mes_schedule_operation_reports(operation_id: int):
+    db = SessionLocal()
+    try:
+        get_mes_schedule_operation_or_404(db, operation_id)
+        reports = (
+            db.query(MesOperationReport)
+            .filter(MesOperationReport.mes_schedule_operation_id == operation_id)
+            .order_by(MesOperationReport.created_at, MesOperationReport.id)
+            .all()
+        )
+
+        return [serialize_mes_operation_report(report) for report in reports]
+    finally:
+        db.close()
+
+
+@app.get("/mes/shift_report")
+def get_mes_shift_report(
+    day: int = 1,
+    shift: int = 1,
+    workshop_id: Optional[int] = None,
+):
+    shift_name, shift_start, shift_end = resolve_shift_report_period(day, shift)
+    db = SessionLocal()
+    try:
+        workshop = None
+
+        if workshop_id is not None:
+            workshop = db.execute(
+                text(
+                    """
+                    SELECT id, name, responsible_name
+                    FROM workshops
+                    WHERE id = :workshop_id
+                    """
+                ),
+                {"workshop_id": workshop_id},
+            ).mappings().first()
+
+            if not workshop:
+                raise HTTPException(status_code=404, detail="Участок не найден")
+
+        rows = db.execute(
+            text(
+                """
+                SELECT
+                    r.id AS report_id,
+                    r.mes_schedule_operation_id,
+                    mso.schedule_run_id,
+                    mso.order_no,
+                    mso.product_name,
+                    mso.operation_name,
+                    mso.operation_type,
+                    mso.machine_id,
+                    mso.machine_name,
+                    mso.machine_group_id,
+                    w.id AS workshop_id,
+                    COALESCE(w.name, 'Без участка') AS workshop_name,
+                    w.responsible_name,
+                    mso.quantity,
+                    mso.status AS operation_status,
+                    r.started_at,
+                    r.ended_at,
+                    r.good_quantity,
+                    r.defect_quantity,
+                    r.comment,
+                    r.reported_by,
+                    COALESCE(r.report_type, 'production') AS report_type,
+                    r.corrected_report_id,
+                    r.correction_reason,
+                    r.created_at
+                FROM mes_operation_reports r
+                JOIN mes_schedule_operations mso
+                  ON mso.id = r.mes_schedule_operation_id
+                JOIN mes_schedule_runs msr
+                  ON msr.id = mso.schedule_run_id
+                LEFT JOIN workshop_machine_groups wmg
+                  ON wmg.machine_group_id = mso.machine_group_id
+                LEFT JOIN workshops w
+                  ON w.id = wmg.workshop_id
+                WHERE r.ended_at IS NOT NULL
+                  AND r.ended_at >= :shift_start
+                  AND r.ended_at < :shift_end
+                  AND (:workshop_id IS NULL OR w.id = :workshop_id)
+                ORDER BY r.ended_at ASC, mso.machine_id ASC, mso.order_no ASC
+                """
+            ),
+            {
+                "shift_start": shift_start,
+                "shift_end": shift_end,
+                "workshop_id": workshop_id,
+            },
+        ).mappings().all()
+
+        reports = []
+        operation_ids = set()
+        good_quantity = 0
+        defect_quantity = 0
+
+        for row in rows:
+            report_good_quantity = int(row["good_quantity"] or 0)
+            report_defect_quantity = int(row["defect_quantity"] or 0)
+            operation_ids.add(row["mes_schedule_operation_id"])
+            good_quantity += report_good_quantity
+            defect_quantity += report_defect_quantity
+            reports.append(
+                {
+                    "report_id": row["report_id"],
+                    "mes_schedule_operation_id": row["mes_schedule_operation_id"],
+                    "schedule_run_id": row["schedule_run_id"],
+                    "order_no": row["order_no"],
+                    "product_name": row["product_name"],
+                    "operation_name": row["operation_name"],
+                    "operation_type": row["operation_type"],
+                    "machine_id": row["machine_id"],
+                    "machine_name": row["machine_name"],
+                    "machine_group_id": row["machine_group_id"],
+                    "workshop_id": row["workshop_id"],
+                    "workshop_name": row["workshop_name"] or "Без участка",
+                    "responsible_name": row["responsible_name"],
+                    "quantity": int(row["quantity"] or 0),
+                    "operation_status": row["operation_status"],
+                    "started_at": _datetime_to_iso(row["started_at"]),
+                    "ended_at": _datetime_to_iso(row["ended_at"]),
+                    "good_quantity": report_good_quantity,
+                    "defect_quantity": report_defect_quantity,
+                    "comment": row["comment"],
+                    "reported_by": row["reported_by"],
+                    "report_type": row["report_type"] or "production",
+                    "corrected_report_id": row["corrected_report_id"],
+                    "correction_reason": row["correction_reason"],
+                    "created_at": _datetime_to_iso(row["created_at"]),
+                }
+            )
+
+        return {
+            "day": day,
+            "shift": shift,
+            "shift_name": shift_name,
+            "shift_start": shift_start.isoformat(),
+            "shift_end": shift_end.isoformat(),
+            "workshop": (
+                {
+                    "id": workshop["id"],
+                    "name": workshop["name"],
+                    "responsible_name": workshop["responsible_name"],
+                }
+                if workshop
+                else None
+            ),
+            "summary": {
+                "reports_count": len(reports),
+                "operations_count": len(operation_ids),
+                "good_quantity": good_quantity,
+                "defect_quantity": defect_quantity,
+            },
+            "reports": reports,
+        }
     finally:
         db.close()
 
@@ -1486,6 +2354,7 @@ def clone_active_plan_version():
                     machine_id,
                     start_time,
                     end_time,
+                    setup_minutes,
                     is_locked,
                     lock_reason
                 )
@@ -1495,6 +2364,7 @@ def clone_active_plan_version():
                     machine_id,
                     start_time,
                     end_time,
+                    setup_minutes,
                     is_locked,
                     lock_reason
                 FROM plan_operations
@@ -1823,8 +2693,8 @@ def get_plan_version_diff(plan_version_id: int):
                     draft_po.start_time AS draft_start,
                     active_po.end_time AS active_end,
                     draft_po.end_time AS draft_end,
-                    coalesce(active_rate.setup_minutes, 0) AS active_setup_minutes,
-                    coalesce(draft_rate.setup_minutes, 0) AS draft_setup_minutes,
+                    coalesce(active_po.setup_minutes, active_rate.setup_minutes, 0) AS active_setup_minutes,
+                    coalesce(draft_po.setup_minutes, draft_rate.setup_minutes, 0) AS draft_setup_minutes,
                     active_po.machine_id IS DISTINCT FROM draft_po.machine_id
                         AS machine_changed,
                     active_po.start_time IS DISTINCT FROM draft_po.start_time
@@ -2242,7 +3112,10 @@ def get_operations(plan_version_id: Optional[int] = None):
                         row_number() OVER (
                             PARTITION BY oi.order_id
                             ORDER BY oi.priority, oi.id
-                        ) AS item_no
+                        ) AS item_no,
+                        count(*) OVER (
+                            PARTITION BY oi.order_id
+                        ) AS item_count
                     FROM order_items oi
                 ),
                 operation_numbers AS (
@@ -2251,6 +3124,7 @@ def get_operations(plan_version_id: Optional[int] = None):
                         item_numbers.order_id,
                         o.order_no,
                         item_numbers.item_no,
+                        item_numbers.item_count,
                         p.name AS product_name,
                         row_number() OVER (
                             PARTITION BY oi.id
@@ -2271,13 +3145,22 @@ def get_operations(plan_version_id: Optional[int] = None):
                     coalesce(m.name, po.machine_id) AS machine_name,
                     m.group_id AS machine_group_id,
                     oo.operation_type,
+                    oi.id AS order_item_id,
+                    oo.quantity,
                     ro.operation_name,
                     onum.order_id,
                     onum.order_no,
                     onum.item_no,
+                    onum.item_count,
                     onum.product_name,
+                    CASE
+                        WHEN COALESCE(onum.item_count, 1) > 1
+                        THEN onum.product_name || ' / партия ' || onum.item_no || ' из ' || onum.item_count
+                        ELSE onum.product_name
+                    END AS product_display_name,
                     onum.operation_no,
-                    coalesce(mpr.setup_minutes, 0) AS setup_minutes,
+                    coalesce(po.setup_minutes, mpr.setup_minutes, 0) AS setup_minutes,
+                    mes.mes_schedule_operation_id,
                     mes.schedule_run_id AS mes_schedule_run_id,
                     mes.mes_schedule_status,
                     mes.mes_operation_status
@@ -2293,19 +3176,25 @@ def get_operations(plan_version_id: Optional[int] = None):
                  AND mpr.operation_type = oo.operation_type
                 LEFT JOIN LATERAL (
                     SELECT
+                        mso.id AS mes_schedule_operation_id,
                         mso.schedule_run_id,
                         mso.status AS mes_operation_status,
                         msr.status AS mes_schedule_status
                     FROM mes_schedule_operations mso
                     JOIN mes_schedule_runs msr
                       ON msr.id = mso.schedule_run_id
-                    WHERE mso.source_plan_operation_id = po.id
-                      AND msr.status IN ('created', 'released')
+                    WHERE (
+                        mso.source_plan_operation_id = po.id
+                        OR mso.operation_id = po.operation_id
+                    )
+                      AND msr.status IN ('created', 'released', 'in_work', 'completed')
                     ORDER BY
                       CASE msr.status
-                        WHEN 'released' THEN 1
-                        WHEN 'created' THEN 2
-                        ELSE 3
+                        WHEN 'in_work' THEN 1
+                        WHEN 'released' THEN 2
+                        WHEN 'completed' THEN 3
+                        WHEN 'created' THEN 4
+                        ELSE 5
                       END,
                       msr.id DESC
                     LIMIT 1
@@ -2323,24 +3212,28 @@ def get_operations(plan_version_id: Optional[int] = None):
                 "plan_version_id": row["plan_version_id"],
                 "label": (
                     (
-                        f"{row['order_no']} {row['product_name']}"
+                        f"{row['order_no']} {row['product_display_name']}"
                         if row["order_no"]
-                        else f"{int(row['order_id']):03d} {row['product_name']}"
+                        else f"{int(row['order_id']):03d} {row['product_display_name']}"
                     )
                     if row["order_id"] is not None
-                    and row["product_name"] is not None
+                    and row["product_display_name"] is not None
                     else str(row["operation_id"])
                 ),
                 "order_id": row["order_id"],
+                "order_no": row["order_no"],
+                "order_item_id": row["order_item_id"],
                 "machine": row["machine_id"],
                 "machine_name": row["machine_name"],
                 "machine_group_id": row["machine_group_id"],
                 "operation_type": row["operation_type"],
                 "operation_name": row["operation_name"],
-                "product_name": row["product_name"],
+                "product_name": row["product_display_name"],
+                "quantity": int(row["quantity"] or 0),
                 "setup_minutes": int(row["setup_minutes"] or 0),
                 "start": int(row["start_time"]) if row["start_time"] is not None else 0,
                 "end": int(row["end_time"]) if row["end_time"] is not None else 0,
+                "mes_schedule_operation_id": row["mes_schedule_operation_id"],
                 "mes_schedule_run_id": row["mes_schedule_run_id"],
                 "mes_schedule_status": row["mes_schedule_status"],
                 "mes_operation_status": row["mes_operation_status"],
@@ -2472,21 +3365,32 @@ async def update_operation(
                 FROM mes_schedule_operations mso
                 JOIN mes_schedule_runs msr
                   ON msr.id = mso.schedule_run_id
-                WHERE mso.source_plan_operation_id = :plan_operation_id
-                  AND msr.status = 'released'
-                  AND mso.status = 'released'
+                WHERE (
+                    mso.source_plan_operation_id = :plan_operation_id
+                    OR mso.operation_id = :operation_id
+                )
+                  AND msr.status IN ('created', 'released', 'in_work', 'completed')
+                  AND mso.status IN (
+                    'released',
+                    'in_work',
+                    'partially_completed',
+                    'completed'
+                  )
                 LIMIT 1
                 """
             ),
-            {"plan_operation_id": op.id},
+            {
+                "plan_operation_id": op.id,
+                "operation_id": op.operation_id,
+            },
         ).mappings().first()
 
         if mes_lock:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "Операция уже выпущена в производственное задание "
-                    f"№{mes_lock['schedule_run_id']} и не может быть изменена в APS"
+                    "Операция уже передана в MES или выполнена "
+                    "и не может быть изменена в APS"
                 ),
             )
 
@@ -2623,7 +3527,11 @@ async def update_operation(
                 detail="Для изделия задана некорректная норма на выбранном станке",
             )
 
-        setup_minutes = int(rate["setup_minutes"] or 0)
+        setup_minutes = int(
+            op.setup_minutes
+            if op.setup_minutes is not None
+            else (rate["setup_minutes"] or 0)
+        )
         quantity = int(operation_context["quantity"])
         duration_minutes = ceil(quantity / units_per_minute) + setup_minutes
         calculated_end = start + duration_minutes
@@ -2632,7 +3540,7 @@ async def update_operation(
             raise HTTPException(
                 status_code=409,
                 detail={
-                    "message": "Операция должна полностью находиться в рабочем интервале смены",
+                    "message": "Операция должна начинаться в рабочее время смены",
                     "start_time": start,
                     "end_time": calculated_end,
                 },
@@ -2752,7 +3660,10 @@ async def update_operation(
                         row_number() OVER (
                             PARTITION BY oi.order_id
                             ORDER BY oi.priority, oi.id
-                        ) AS item_no
+                        ) AS item_no,
+                        count(*) OVER (
+                            PARTITION BY oi.order_id
+                        ) AS item_count
                     FROM order_items oi
                 ),
                 operation_numbers AS (
@@ -2761,6 +3672,7 @@ async def update_operation(
                         item_numbers.order_id,
                         o.order_no,
                         item_numbers.item_no,
+                        item_numbers.item_count,
                         p.name AS product_name,
                         row_number() OVER (
                             PARTITION BY oi.id
@@ -2780,9 +3692,15 @@ async def update_operation(
                     onum.order_id,
                     onum.order_no,
                     onum.item_no,
+                    onum.item_count,
                     onum.product_name,
+                    CASE
+                        WHEN COALESCE(onum.item_count, 1) > 1
+                        THEN onum.product_name || ' / партия ' || onum.item_no || ' из ' || onum.item_count
+                        ELSE onum.product_name
+                    END AS product_display_name,
                     onum.operation_no,
-                    coalesce(mpr.setup_minutes, 0) AS setup_minutes
+                    :setup_minutes AS setup_minutes
                 FROM order_operations oo
                 JOIN order_items oi ON oi.id = oo.order_item_id
                 LEFT JOIN routing_operations ro ON ro.id = oo.routing_operation_id
@@ -2798,6 +3716,7 @@ async def update_operation(
             {
                 "operation_id": op.operation_id,
                 "machine_id": op.machine_id,
+                "setup_minutes": int(op.setup_minutes or 0),
             },
         ).mappings().first()
 
@@ -2808,13 +3727,13 @@ async def update_operation(
                 "plan_version_id": requested_plan_version_id,
                 "label": (
                     (
-                        f"{operation_meta['order_no']} {operation_meta['product_name']}"
+                        f"{operation_meta['order_no']} {operation_meta['product_display_name']}"
                         if operation_meta["order_no"]
-                        else f"{int(operation_meta['order_id']):03d} {operation_meta['product_name']}"
+                        else f"{int(operation_meta['order_id']):03d} {operation_meta['product_display_name']}"
                     )
                     if operation_meta
                     and operation_meta["order_id"] is not None
-                    and operation_meta["product_name"] is not None
+                    and operation_meta["product_display_name"] is not None
                     else str(op.operation_id)
                 ),
                 "order_id": (
@@ -2834,7 +3753,7 @@ async def update_operation(
                     operation_meta["operation_name"] if operation_meta else None
                 ),
                 "product_name": (
-                    operation_meta["product_name"] if operation_meta else None
+                    operation_meta["product_display_name"] if operation_meta else None
                 ),
                 "setup_minutes": (
                     int(operation_meta["setup_minutes"] or 0)

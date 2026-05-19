@@ -68,6 +68,10 @@ def init_db_schema():
             )
         if "lock_reason" not in columns:
             statements.append("ALTER TABLE plan_operations ADD COLUMN lock_reason VARCHAR")
+        if "setup_minutes" not in columns:
+            statements.append(
+                "ALTER TABLE plan_operations ADD COLUMN setup_minutes INTEGER DEFAULT 0"
+            )
 
     if "mes_schedule_runs" in table_names:
         columns = {column["name"] for column in inspector.get_columns("mes_schedule_runs")}
@@ -116,6 +120,11 @@ def init_db_schema():
             "planned_start_time": "INTEGER",
             "planned_end_time": "INTEGER",
             "status": "TEXT",
+            "actual_start_at": "TIMESTAMP",
+            "actual_end_at": "TIMESTAMP",
+            "good_quantity": "INTEGER DEFAULT 0",
+            "defect_quantity": "INTEGER DEFAULT 0",
+            "actual_comment": "TEXT",
         }
 
         for column_name, column_type in expected_columns.items():
@@ -124,9 +133,44 @@ def init_db_schema():
                     f"ALTER TABLE mes_schedule_operations ADD COLUMN {column_name} {column_type}"
                 )
 
+    if "mes_operation_reports" in table_names:
+        columns = {
+            column["name"]
+            for column in inspector.get_columns("mes_operation_reports")
+        }
+        expected_columns = {
+            "mes_schedule_operation_id": "INTEGER",
+            "started_at": "TIMESTAMP",
+            "ended_at": "TIMESTAMP",
+            "good_quantity": "INTEGER",
+            "defect_quantity": "INTEGER",
+            "comment": "TEXT",
+            "reported_by": "TEXT",
+            "report_type": "VARCHAR DEFAULT 'production'",
+            "corrected_report_id": "INTEGER",
+            "correction_reason": "TEXT",
+            "created_at": "TIMESTAMP DEFAULT now()",
+        }
+
+        for column_name, column_type in expected_columns.items():
+            if column_name not in columns:
+                statements.append(
+                    f"ALTER TABLE mes_operation_reports ADD COLUMN {column_name} {column_type}"
+                )
+
     with engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))
+
+        connection.execute(
+            text(
+                """
+                UPDATE mes_operation_reports
+                SET report_type = 'production'
+                WHERE report_type IS NULL
+                """
+            )
+        )
 
         connection.execute(
             text(
@@ -211,8 +255,8 @@ def init_db_schema():
                     is_active
                 )
                 VALUES
-                    (1, 'Смена 1', 360, 840, 20, 20, true),
-                    (2, 'Смена 2', 840, 1320, 20, 20, true)
+                    (1, 'Смена 1', 480, 1140, 0, 0, true),
+                    (2, 'Смена 2', 1200, 420, 0, 0, true)
                 ON CONFLICT (id) DO UPDATE
                 SET
                     name = EXCLUDED.name,
@@ -236,8 +280,8 @@ def init_db_schema():
                     end_minute_of_shift
                 )
                 VALUES
-                    (1, 1, 'Обед', 240, 270),
-                    (2, 2, 'Обед', 240, 270)
+                    (1, 1, 'Обед', 240, 300),
+                    (2, 2, 'Обед', 240, 300)
                 ON CONFLICT (id) DO UPDATE
                 SET
                     shift_template_id = EXCLUDED.shift_template_id,
@@ -290,6 +334,60 @@ def init_db_schema():
                     FROM machine_group_setup_teams existing
                     WHERE existing.machine_group_id = mapping.machine_group_id
                       AND existing.setup_team_id = mapping.setup_team_id
+                )
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                INSERT INTO workshops (
+                    code,
+                    name,
+                    responsible_name,
+                    sort_order
+                )
+                VALUES
+                    ('COILING_SHOP', 'Навивка', 'Мастер навивки', 10),
+                    ('FACING_SHOP', 'Торцовка', 'Мастер торцовки', 20),
+                    ('BENDING_SHOP', 'Загиб', 'Мастер загиба', 30),
+                    ('HEAT_SHOP', 'Термичка', 'Мастер термички', 40),
+                    ('COATING_SHOP', 'Покрытие', 'Мастер покрытия', 50)
+                ON CONFLICT (code) DO UPDATE
+                SET
+                    name = EXCLUDED.name,
+                    responsible_name = EXCLUDED.responsible_name,
+                    sort_order = EXCLUDED.sort_order
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                INSERT INTO workshop_machine_groups (
+                    workshop_id,
+                    machine_group_id
+                )
+                SELECT w.id, mapping.machine_group_id
+                FROM (
+                    VALUES
+                        ('COILING_SHOP', 'COIL_A'),
+                        ('COILING_SHOP', 'COIL_B'),
+                        ('FACING_SHOP', 'FACE'),
+                        ('BENDING_SHOP', 'BEND'),
+                        ('HEAT_SHOP', 'HEAT'),
+                        ('COATING_SHOP', 'COAT_A'),
+                        ('COATING_SHOP', 'COAT_B')
+                ) AS mapping(workshop_code, machine_group_id)
+                JOIN workshops w
+                  ON w.code = mapping.workshop_code
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM workshop_machine_groups existing
+                    WHERE existing.workshop_id = w.id
+                      AND existing.machine_group_id = mapping.machine_group_id
                 )
                 """
             )

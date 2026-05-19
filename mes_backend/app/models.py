@@ -13,6 +13,7 @@ class PlanOperation(Base):
     machine_id = Column(String)
     start_time = Column(Integer)
     end_time = Column(Integer)
+    setup_minutes = Column(Integer, default=0)
     is_locked = Column(Boolean, default=False)
     lock_reason = Column(String)
 
@@ -111,6 +112,24 @@ class MachineGroupSetupTeam(Base):
     setup_team_id = Column(String)
 
 
+class Workshop(Base):
+    __tablename__ = "workshops"
+
+    id = Column(Integer, primary_key=True)
+    code = Column(String, unique=True, nullable=False)
+    name = Column(String, nullable=False)
+    responsible_name = Column(String)
+    sort_order = Column(Integer, default=999)
+
+
+class WorkshopMachineGroup(Base):
+    __tablename__ = "workshop_machine_groups"
+
+    id = Column(Integer, primary_key=True)
+    workshop_id = Column(Integer, nullable=False)
+    machine_group_id = Column(String, nullable=False)
+
+
 class MesScheduleRun(Base):
     __tablename__ = "mes_schedule_runs"
 
@@ -151,3 +170,25 @@ class MesScheduleOperation(Base):
     planned_start_time = Column(Integer)
     planned_end_time = Column(Integer)
     status = Column(String)
+    actual_start_at = Column(DateTime)
+    actual_end_at = Column(DateTime)
+    good_quantity = Column(Integer, default=0)
+    defect_quantity = Column(Integer, default=0)
+    actual_comment = Column(String)
+
+
+class MesOperationReport(Base):
+    __tablename__ = "mes_operation_reports"
+
+    id = Column(Integer, primary_key=True)
+    mes_schedule_operation_id = Column(Integer)
+    started_at = Column(DateTime)
+    ended_at = Column(DateTime)
+    good_quantity = Column(Integer)
+    defect_quantity = Column(Integer)
+    comment = Column(String)
+    reported_by = Column(String)
+    report_type = Column(String, default="production")
+    corrected_report_id = Column(Integer)
+    correction_reason = Column(String)
+    created_at = Column(DateTime, server_default=func.now())

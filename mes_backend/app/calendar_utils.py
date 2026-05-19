@@ -1,7 +1,7 @@
 from sqlalchemy import text
 
 
-HORIZON_START_MINUTE_OF_DAY = 360
+HORIZON_START_MINUTE_OF_DAY = 480
 
 
 def _load_active_shifts(db):
@@ -169,3 +169,56 @@ def is_inside_work_interval(db, start_time: int, end_time: int) -> bool:
         start_time >= interval_start and end_time <= interval_end
         for interval_start, interval_end in work_intervals
     )
+
+
+def is_working_minute(db, minute: int) -> bool:
+    value = int(minute)
+    return any(
+        interval_start <= value < interval_end
+        for interval_start, interval_end in build_work_intervals(db, value + 1)
+    )
+
+
+def count_working_minutes(db, start_minute: int, end_minute: int) -> int:
+    start = int(start_minute)
+    end = int(end_minute)
+
+    if end <= start:
+        return 0
+
+    total = 0
+    for interval_start, interval_end in build_work_intervals(db, end):
+        overlap_start = max(start, interval_start)
+        overlap_end = min(end, interval_end)
+        if overlap_end > overlap_start:
+            total += overlap_end - overlap_start
+
+    return total
+
+
+def add_working_minutes(db, start_minute: int, duration_minutes: int) -> int:
+    start = int(start_minute)
+    remaining = int(duration_minutes)
+
+    if remaining <= 0:
+        return start
+
+    horizon_end = start + remaining + 1440
+
+    while True:
+        for interval_start, interval_end in build_work_intervals(db, horizon_end):
+            if interval_end <= start:
+                continue
+
+            if start < interval_start:
+                start = interval_start
+
+            if interval_start <= start < interval_end:
+                available = interval_end - start
+                if remaining <= available:
+                    return start + remaining
+
+                remaining -= available
+                start = interval_end
+
+        horizon_end += 1440

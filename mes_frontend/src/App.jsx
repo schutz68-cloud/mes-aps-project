@@ -49,13 +49,23 @@ const VALIDATION_ERROR_LABELS = {
 const MES_RUN_STATUS_LABELS = {
   created: "создано",
   released: "выпущено",
+  in_work: "выполняется",
+  completed: "завершено",
   cancelled: "отменено",
 };
 
 const MES_OPERATION_STATUS_LABELS = {
   planned: "запланировано",
-  excluded: "исключено",
   released: "выпущено",
+  in_work: "в работе",
+  partially_completed: "частично выполнено",
+  completed: "завершено",
+  excluded: "исключено",
+};
+
+const MES_REPORT_TYPE_LABELS = {
+  production: "выполнение",
+  correction: "корректировка",
 };
 
 const MACHINE_GROUP_LABELS = {
@@ -78,7 +88,7 @@ const MACHINE_GROUP_ORDER = {
   COAT_B: 51,
 };
 
-const PLAN_DAY_START_MINUTE_OF_DAY = 6 * 60;
+const PLAN_DAY_START_MINUTE_OF_DAY = 8 * 60;
 
 function formatPlanMinute(minute) {
   const value = Number(minute ?? 0);
@@ -97,20 +107,53 @@ function formatPlanInterval(start, end) {
   return `${formatPlanMinute(start)}–${formatPlanMinute(end)}`;
 }
 
+function formatDateTime(value) {
+  if (!value) return "";
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+
+  return date.toLocaleString("ru-RU");
+}
+
 function getMesOperationRowStyle(status) {
+  const base = {
+    borderLeft: "4px solid transparent",
+  };
+
+  if (status === "planned") {
+    return { ...base, background: "#f8f9fa", borderLeftColor: "#bdbdbd" };
+  }
+
   if (status === "released") {
-    return { background: "#edf7ed" };
+    return { ...base, background: "#e8f5e9", borderLeftColor: "#43a047" };
+  }
+
+  if (status === "in_work") {
+    return { ...base, background: "#fff8e1", borderLeftColor: "#f9a825" };
+  }
+
+  if (status === "partially_completed") {
+    return { ...base, background: "#fff3cd", borderLeftColor: "#fb8c00" };
+  }
+
+  if (status === "completed") {
+    return { ...base, background: "#e3f2fd", borderLeftColor: "#1e88e5" };
   }
 
   if (status === "excluded") {
     return {
-      background: "#f2f2f2",
+      ...base,
+      background: "#eeeeee",
+      borderLeftColor: "#9e9e9e",
       color: "#777",
-      textDecoration: "line-through",
     };
   }
 
-  return {};
+  return base;
 }
 
 const formatMinutesDelta = (value) => {
@@ -190,8 +233,20 @@ function App() {
   const [mesScheduleRuns, setMesScheduleRuns] = useState([]);
   const [selectedMesRun, setSelectedMesRun] = useState(null);
   const [selectedMesRunOperations, setSelectedMesRunOperations] = useState([]);
+  const [selectedMesOperationForReports, setSelectedMesOperationForReports] =
+    useState(null);
+  const [selectedMesOperationReports, setSelectedMesOperationReports] =
+    useState([]);
+  const [isReportsLoading, setIsReportsLoading] = useState(false);
+  const [shiftReportDay, setShiftReportDay] = useState("1");
+  const [shiftReportShift, setShiftReportShift] = useState("1");
+  const [shiftReport, setShiftReport] = useState(null);
+  const [isShiftReportLoading, setIsShiftReportLoading] = useState(false);
   const [showHiddenMesRuns, setShowHiddenMesRuns] = useState(false);
+  const [mesWorkshops, setMesWorkshops] = useState([]);
+  const [selectedMesWorkshopId, setSelectedMesWorkshopId] = useState("");
   const [currentScreen, setCurrentScreen] = useState("aps");
+  const [selectedOrderItemId, setSelectedOrderItemId] = useState(null);
 
   const moveDebounceRef = useRef(new Map());
 
@@ -201,6 +256,8 @@ function App() {
   );
   const displayedPlanVersion = selectedPlanVersion || activePlanVersion;
   const selectedPlanVersionStatus = selectedPlanVersion?.status || "";
+  const isActiveSelectedPlan =
+    !selectedPlanVersionId || selectedPlanVersionStatus === "active";
   const canEditSelectedPlan = selectedPlanVersionStatus === "draft";
   const canEditSelectedPlanName = selectedPlanVersionStatus === "draft";
   const canEditSelectedPlanDescription =
@@ -216,6 +273,28 @@ function App() {
   const filteredActiveOverlayOps = operationFilter
     ? activeOverlayOps.filter((op) => op.operation_type === operationFilter)
     : activeOverlayOps;
+  const selectedOrderItemOperations = selectedOrderItemId
+    ? ops.filter(
+        (op) => String(op.order_item_id) === String(selectedOrderItemId)
+      )
+    : [];
+  const selectedOrderItemSummary =
+    selectedOrderItemOperations.length > 0
+      ? {
+          orderNo:
+            selectedOrderItemOperations[0].order_no ||
+            selectedOrderItemOperations[0].order_id ||
+            "",
+          productName: selectedOrderItemOperations[0].product_name || "",
+          quantity: selectedOrderItemOperations[0].quantity || 0,
+          start: Math.min(
+            ...selectedOrderItemOperations.map((op) => Number(op.start || 0))
+          ),
+          end: Math.max(
+            ...selectedOrderItemOperations.map((op) => Number(op.end || 0))
+          ),
+        }
+      : null;
 
   useEffect(() => {
     setPlanVersionNameInput(selectedPlanVersion?.name || "");
@@ -264,6 +343,37 @@ function App() {
         setCalendarBackgrounds([]);
       });
   }, []);
+
+  const handleSelectGanttOperation = useCallback(
+    (operation) => {
+      if (!isActiveSelectedPlan) {
+        setSelectedOrderItemId(null);
+        return;
+      }
+
+      if (!operation?.order_item_id) {
+        setSelectedOrderItemId(null);
+        return;
+      }
+
+      setSelectedOrderItemId((current) =>
+        String(current) === String(operation.order_item_id)
+          ? null
+          : operation.order_item_id
+      );
+    },
+    [isActiveSelectedPlan]
+  );
+
+  const handleClearGanttSelection = useCallback(() => {
+    setSelectedOrderItemId(null);
+  }, []);
+
+  useEffect(() => {
+    if (!isActiveSelectedPlan) {
+      setSelectedOrderItemId(null);
+    }
+  }, [isActiveSelectedPlan]);
 
   const loadChangeLog = useCallback((planVersionId = selectedPlanVersionId) => {
     const params = new URLSearchParams({ limit: String(HISTORY_LIMIT) });
@@ -361,18 +471,27 @@ function App() {
       .catch(() => {});
   }, [showHiddenMesRuns]);
 
+  const loadMesWorkshops = useCallback(() => {
+    return fetch("http://127.0.0.1:8000/mes/workshops")
+      .then((res) => res.json())
+      .then((data) => setMesWorkshops(Array.isArray(data) ? data : []))
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     loadFreezeHorizon();
     loadActivePlanVersion();
     loadPlanVersions();
     loadMachines();
     loadMesScheduleRuns();
+    loadMesWorkshops();
   }, [
     loadFreezeHorizon,
     loadActivePlanVersion,
     loadPlanVersions,
     loadMachines,
     loadMesScheduleRuns,
+    loadMesWorkshops,
   ]);
 
   useEffect(() => {
@@ -387,8 +506,14 @@ function App() {
   useEffect(() => {
     if (currentScreen === "mes") {
       loadMesScheduleRuns();
+      loadMesWorkshops();
     }
-  }, [currentScreen, loadMesScheduleRuns]);
+  }, [currentScreen, loadMesScheduleRuns, loadMesWorkshops]);
+
+  useEffect(() => {
+    setSelectedMesOperationForReports(null);
+    setSelectedMesOperationReports([]);
+  }, [selectedMesWorkshopId]);
 
   useEffect(() => {
     if (!selectedMesRun) {
@@ -1118,7 +1243,7 @@ function App() {
     [loadMesScheduleRuns, loadOperations]
   );
 
-  const handleOpenMesRun = useCallback(async (runId) => {
+  const handleOpenMesRun = useCallback(async (runId, options = {}) => {
     try {
       const res = await fetch(
         `http://127.0.0.1:8000/mes/schedule_runs/${runId}`
@@ -1138,6 +1263,10 @@ function App() {
       setSelectedMesRunOperations(
         Array.isArray(data.operations) ? data.operations : []
       );
+      if (!options.keepReports) {
+        setSelectedMesOperationForReports(null);
+        setSelectedMesOperationReports([]);
+      }
     } catch (error) {
       console.error("Ошибка открытия производственного задания:", error);
       alert("Не удалось открыть производственное задание");
@@ -1246,6 +1375,8 @@ function App() {
         if (String(selectedMesRun?.id) === String(runId)) {
           setSelectedMesRun(null);
           setSelectedMesRunOperations([]);
+          setSelectedMesOperationForReports(null);
+          setSelectedMesOperationReports([]);
         }
 
         await loadMesScheduleRuns();
@@ -1357,6 +1488,338 @@ function App() {
     [handleOpenMesRun, loadMesScheduleRuns, loadOperations]
   );
 
+  const handleStartMesOperation = useCallback(
+    async (operationId) => {
+      try {
+        const res = await fetch(
+          `http://127.0.0.1:8000/mes/schedule_operations/${operationId}/start`,
+          { method: "POST" }
+        );
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          const detail = data?.detail?.message || data?.detail;
+          alert(
+            "Не удалось начать операцию: " +
+              (detail || JSON.stringify(data))
+          );
+          return;
+        }
+
+        if (selectedMesRun?.id) {
+          await handleOpenMesRun(selectedMesRun.id);
+        }
+
+        await loadMesScheduleRuns();
+        loadOperations();
+      } catch (error) {
+        console.error("Ошибка старта операции:", error);
+        alert("Не удалось начать операцию");
+      }
+    },
+    [handleOpenMesRun, loadMesScheduleRuns, loadOperations, selectedMesRun]
+  );
+
+  const handleOpenMesOperationReports = useCallback(async (operation) => {
+    setSelectedMesOperationForReports(operation);
+    setSelectedMesOperationReports([]);
+    setIsReportsLoading(true);
+
+    try {
+      const res = await fetch(
+        `http://127.0.0.1:8000/mes/schedule_operations/${operation.id}/reports`
+      );
+      const data = await res.json();
+
+      if (!res.ok) {
+        const detail = data?.detail?.message || data?.detail;
+        alert(
+          "Не удалось загрузить журнал выполнения операции: " +
+            (detail || JSON.stringify(data))
+        );
+        return;
+      }
+
+      const reports = Array.isArray(data)
+        ? data
+        : Array.isArray(data.reports)
+        ? data.reports
+        : [];
+
+      setSelectedMesOperationReports(reports);
+    } catch (error) {
+      console.error("Ошибка загрузки журнала выполнения операции:", error);
+      alert("Не удалось загрузить журнал выполнения операции");
+    } finally {
+      setIsReportsLoading(false);
+    }
+  }, []);
+
+  const handleCloseMesOperationReports = useCallback(() => {
+    setSelectedMesOperationForReports(null);
+    setSelectedMesOperationReports([]);
+  }, []);
+
+  const handleLoadShiftReport = useCallback(async () => {
+    const day = Number(shiftReportDay);
+    const shift = Number(shiftReportShift);
+
+    if (!Number.isInteger(day) || day < 1) {
+      alert("День сменного отчёта должен быть целым числом больше нуля");
+      return;
+    }
+
+    if (![1, 2].includes(shift)) {
+      alert("Номер смены должен быть 1 или 2");
+      return;
+    }
+
+    setIsShiftReportLoading(true);
+
+    try {
+      const params = new URLSearchParams({
+        day: String(day),
+        shift: String(shift),
+      });
+
+      if (selectedMesWorkshopId) {
+        params.set("workshop_id", selectedMesWorkshopId);
+      }
+
+      const res = await fetch(
+        `http://127.0.0.1:8000/mes/shift_report?${params.toString()}`
+      );
+      const data = await res.json();
+
+      if (!res.ok) {
+        const detail = data?.detail?.message || data?.detail;
+        alert(
+          "Не удалось загрузить сменный отчёт: " +
+            (detail || JSON.stringify(data))
+        );
+        return;
+      }
+
+      setShiftReport(data);
+    } catch (error) {
+      console.error("Ошибка загрузки сменного отчёта:", error);
+      alert("Не удалось загрузить сменный отчёт");
+    } finally {
+      setIsShiftReportLoading(false);
+    }
+  }, [selectedMesWorkshopId, shiftReportDay, shiftReportShift]);
+
+  const handleCompleteMesOperation = useCallback(
+    async (operation) => {
+      const goodRaw = window.prompt("Введите годное количество", "0");
+      if (goodRaw === null) {
+        return;
+      }
+
+      const defectRaw = window.prompt("Введите количество брака", "0");
+      if (defectRaw === null) {
+        return;
+      }
+
+      const comment = window.prompt("Комментарий", "") || "";
+      const goodQuantity = Number(goodRaw);
+      const defectQuantity = Number(defectRaw);
+
+      if (
+        !Number.isInteger(goodQuantity) ||
+        !Number.isInteger(defectQuantity) ||
+        goodQuantity < 0 ||
+        defectQuantity < 0 ||
+        goodQuantity + defectQuantity <= 0
+      ) {
+        alert(
+          "Количество должно быть целым неотрицательным числом, сумма должна быть больше нуля"
+        );
+        return;
+      }
+
+      const availableQuantity = Number(operation.available_quantity || 0);
+      const reportedQuantity = goodQuantity + defectQuantity;
+
+      if (reportedQuantity > availableQuantity) {
+        alert(
+          `Нельзя зафиксировать выполнение больше доступного количества. Доступно: ${availableQuantity}`
+        );
+        return;
+      }
+
+      try {
+        const shouldRefreshReports =
+          selectedMesOperationForReports &&
+          String(selectedMesOperationForReports.id) === String(operation.id);
+        const res = await fetch(
+          `http://127.0.0.1:8000/mes/schedule_operations/${operation.id}/complete`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              good_quantity: goodQuantity,
+              defect_quantity: defectQuantity,
+              comment,
+            }),
+          }
+        );
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          const detail = data?.detail?.message || data?.detail;
+          alert(
+            "Не удалось зафиксировать выполнение: " +
+              (detail || JSON.stringify(data))
+          );
+          return;
+        }
+
+        if (selectedMesRun?.id) {
+          await handleOpenMesRun(selectedMesRun.id);
+        }
+
+        await loadMesScheduleRuns();
+        loadOperations();
+        if (shouldRefreshReports) {
+          await handleOpenMesOperationReports(data.operation || operation);
+        }
+      } catch (error) {
+        console.error("Ошибка фиксации выполнения:", error);
+        alert("Не удалось зафиксировать выполнение");
+      }
+    },
+    [
+      handleOpenMesOperationReports,
+      handleOpenMesRun,
+      loadMesScheduleRuns,
+      loadOperations,
+      selectedMesOperationForReports,
+      selectedMesRun,
+    ]
+  );
+
+  const handleCorrectMesOperationReport = useCallback(
+    async (report) => {
+      const reportId = report.id ?? report.report_id;
+
+      if (!reportId) {
+        alert("Не найден ID записи журнала выполнения");
+        return;
+      }
+
+      const currentGood = Number(report.good_quantity || 0);
+      const currentDefect = Number(report.defect_quantity || 0);
+
+      const goodRaw = window.prompt(
+        "Введите новое годное количество для этой записи",
+        String(currentGood)
+      );
+      if (goodRaw === null) {
+        return;
+      }
+
+      const defectRaw = window.prompt(
+        "Введите новое количество брака для этой записи",
+        String(currentDefect)
+      );
+      if (defectRaw === null) {
+        return;
+      }
+
+      const reason = window.prompt("Причина исправления", "");
+      if (reason === null) {
+        return;
+      }
+
+      const goodQuantity = Number(goodRaw);
+      const defectQuantity = Number(defectRaw);
+
+      if (
+        !Number.isInteger(goodQuantity) ||
+        !Number.isInteger(defectQuantity) ||
+        goodQuantity < 0 ||
+        defectQuantity < 0
+      ) {
+        alert("Количество должно быть целым неотрицательным числом");
+        return;
+      }
+
+      if (!String(reason || "").trim()) {
+        alert("Укажите причину исправления");
+        return;
+      }
+
+      try {
+        const operationForReports = selectedMesOperationForReports;
+        const res = await fetch(
+          `http://127.0.0.1:8000/mes/operation_reports/${reportId}/correct`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              good_quantity: goodQuantity,
+              defect_quantity: defectQuantity,
+              reason: reason.trim(),
+            }),
+          }
+        );
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          const detail = data?.detail?.message || data?.detail;
+          alert(
+            "Не удалось исправить запись выполнения: " +
+              (detail || JSON.stringify(data))
+          );
+          return;
+        }
+
+        if (data.report) {
+          setSelectedMesOperationReports((current) => [
+            ...current,
+            data.report,
+          ]);
+        }
+
+        if (data.operation) {
+          setSelectedMesOperationForReports(data.operation);
+        }
+
+        if (selectedMesRun?.id) {
+          await handleOpenMesRun(selectedMesRun.id, { keepReports: true });
+        }
+
+        await loadMesScheduleRuns();
+        loadOperations();
+
+        if (operationForReports?.id) {
+          await handleOpenMesOperationReports(
+            data.operation || operationForReports
+          );
+        }
+
+        alert(
+          "Исправление сохранено: создана корректирующая запись, исходная запись журнала не изменялась"
+        );
+      } catch (error) {
+        console.error("Ошибка исправления записи выполнения:", error);
+        alert("Не удалось исправить запись выполнения");
+      }
+    },
+    [
+      handleOpenMesOperationReports,
+      handleOpenMesRun,
+      loadMesScheduleRuns,
+      loadOperations,
+      selectedMesOperationForReports,
+      selectedMesRun,
+    ]
+  );
+
   const isChangeRolledBack = (value) => {
     return value === true || value === "true" || value === 1 || value === "1";
   };
@@ -1382,8 +1845,14 @@ function App() {
     ).values()
   );
   const latestRollbackChangeGroup = changeLog.find(canRollbackChangeSetRow);
+  const visibleSelectedMesRunOperations = selectedMesWorkshopId
+    ? selectedMesRunOperations.filter(
+        (operation) =>
+          String(operation.workshop_id || "") === String(selectedMesWorkshopId)
+      )
+    : selectedMesRunOperations;
   const mesOperationsByGroup = Array.from(
-    selectedMesRunOperations.reduce((map, operation) => {
+    visibleSelectedMesRunOperations.reduce((map, operation) => {
       const key = operation.machine_group_id || "UNKNOWN";
 
       if (!map.has(key)) {
@@ -1482,6 +1951,7 @@ function App() {
               setIsPlanVersionEditOpen(false);
               setShowActiveOverlay(false);
               setActiveOverlayOps([]);
+              setSelectedOrderItemId(null);
 
               if (value) {
                 localStorage.setItem(SELECTED_PLAN_VERSION_STORAGE_KEY, value);
@@ -2298,7 +2768,39 @@ function App() {
         onMove={handleMove}
         freezeHorizonMinutes={freezeHorizonMinutes}
         canEdit={canEditSelectedPlan}
+        enableOrderSelection={isActiveSelectedPlan}
+        selectedOrderItemId={isActiveSelectedPlan ? selectedOrderItemId : null}
+        onSelectOperation={handleSelectGanttOperation}
+        onClearSelection={handleClearGanttSelection}
       />
+      {isActiveSelectedPlan && selectedOrderItemSummary && (
+        <div
+          style={{
+            marginTop: "10px",
+            padding: "8px 10px",
+            border: "1px solid #ccc",
+            background: "#f7fbff",
+            display: "flex",
+            gap: "16px",
+            alignItems: "center",
+            flexWrap: "wrap",
+            fontSize: "14px",
+          }}
+        >
+          <strong>Выбранная позиция:</strong>
+          <span>Заказ: {selectedOrderItemSummary.orderNo}</span>
+          <span>Изделие: {selectedOrderItemSummary.productName}</span>
+          <span>Количество: {selectedOrderItemSummary.quantity}</span>
+          <span>Старт: {formatPlanMinute(selectedOrderItemSummary.start)}</span>
+          <span>Финиш: {formatPlanMinute(selectedOrderItemSummary.end)}</span>
+          <button
+            onClick={handleClearGanttSelection}
+            style={{ padding: "4px 8px", cursor: "pointer" }}
+          >
+            Сбросить выделение
+          </button>
+        </div>
+      )}
         </>
       )}
 
@@ -2335,6 +2837,32 @@ function App() {
           >
             Создать на завтра
           </button>
+
+          <label
+            style={{
+              display: "flex",
+              gap: "6px",
+              alignItems: "center",
+              color: "#555",
+            }}
+          >
+            <span>Участок:</span>
+            <select
+              value={selectedMesWorkshopId}
+              onChange={(e) => setSelectedMesWorkshopId(e.target.value)}
+              style={{ padding: "6px", minWidth: "180px" }}
+            >
+              <option value="">Все участки</option>
+              {mesWorkshops.map((workshop) => (
+                <option key={workshop.id} value={String(workshop.id)}>
+                  {workshop.name}
+                  {workshop.responsible_name
+                    ? ` — ${workshop.responsible_name}`
+                    : ""}
+                </option>
+              ))}
+            </select>
+          </label>
 
           <label
             style={{
@@ -2466,6 +2994,8 @@ function App() {
 
             {selectedMesRunOperations.length === 0 ? (
               <div>В задании нет операций</div>
+            ) : visibleSelectedMesRunOperations.length === 0 ? (
+              <div>Для выбранного участка операций в этом задании нет</div>
             ) : (
               <div style={{ maxHeight: "420px", overflow: "auto" }}>
                 {mesOperationsByGroup.map(([groupId, operations]) => (
@@ -2490,92 +3020,571 @@ function App() {
                     >
                       <thead>
                         <tr>
+                          <th style={thStyle}>MES ID</th>
                           <th style={thStyle}>Заказ</th>
                           <th style={thStyle}>Изделие</th>
+                          <th style={thStyle}>Участок</th>
                           <th style={thStyle}>Операция</th>
                           <th style={thStyle}>Станок</th>
                           <th style={thStyle}>Плановое время</th>
+                          <th style={thStyle}>План</th>
+                          <th style={thStyle}>Доступно</th>
+                          <th style={thStyle}>Годно</th>
+                          <th style={thStyle}>Брак</th>
+                          <th style={thStyle}>Остаток</th>
+                          <th style={thStyle}>Факт начала</th>
+                          <th style={thStyle}>Факт окончания</th>
                           <th style={thStyle}>Статус операции</th>
                           <th style={thStyle}>Действие</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {operations.map((operation) => (
-                          <tr
-                            key={operation.id}
-                            style={getMesOperationRowStyle(operation.status)}
-                          >
-                            <td style={tdStyle}>
-                              {operation.order_no || operation.order_id}
-                            </td>
-                            <td style={tdStyle}>
-                              {operation.product_name || operation.product_id}
-                            </td>
-                            <td style={tdStyle}>
-                              {operation.operation_name ||
-                                OPERATION_NAMES[operation.operation_type] ||
-                                operation.operation_type}
-                            </td>
-                            <td style={tdStyle}>
-                              {operation.machine_name || operation.machine_id}
-                            </td>
-                            <td style={tdStyle}>
-                              {formatPlanInterval(
-                                operation.planned_start_time,
-                                operation.planned_end_time
-                              )}
-                            </td>
-                            <td style={tdStyle}>
-                              {MES_OPERATION_STATUS_LABELS[operation.status] ||
-                                operation.status}
-                            </td>
-                            <td style={tdStyle}>
-                              {selectedMesRun.status === "created" &&
-                                operation.status !== "excluded" && (
-                                  <button
-                                    onClick={() =>
-                                      handleExcludeMesOrderItem(
-                                        selectedMesRun.id,
-                                        operation.order_item_id
-                                      )
-                                    }
-                                    style={{
-                                      padding: "4px 8px",
-                                      cursor: "pointer",
-                                    }}
-                                  >
-                                    Исключить позицию
-                                  </button>
-                                )}
+                        {operations.map((operation) => {
+                          const remainingQuantity = Math.max(
+                            Number(operation.quantity || 0) -
+                              Number(operation.good_quantity || 0),
+                            0
+                          );
+                          const canStartOperation =
+                            ["released", "in_work"].includes(
+                              selectedMesRun.status
+                            ) &&
+                            ["released", "partially_completed"].includes(
+                              operation.status
+                            );
 
-                              {selectedMesRun.status === "created" &&
-                                operation.status === "excluded" && (
-                                  <button
-                                    onClick={() =>
-                                      handleIncludeMesOrderItem(
-                                        selectedMesRun.id,
-                                        operation.order_item_id
-                                      )
-                                    }
-                                    style={{
-                                      padding: "4px 8px",
-                                      cursor: "pointer",
-                                    }}
-                                  >
-                                    Вернуть позицию
-                                  </button>
+                          return (
+                            <tr
+                              key={operation.id}
+                              style={getMesOperationRowStyle(operation.status)}
+                            >
+                              <td style={tdStyle}>{operation.id}</td>
+                              <td style={tdStyle}>
+                                {operation.order_no || operation.order_id}
+                              </td>
+                              <td style={tdStyle}>
+                                {operation.product_name || operation.product_id}
+                              </td>
+                              <td style={tdStyle}>
+                                {operation.workshop_name || "Без участка"}
+                              </td>
+                              <td style={tdStyle}>
+                                {operation.operation_name ||
+                                  OPERATION_NAMES[operation.operation_type] ||
+                                  operation.operation_type}
+                              </td>
+                              <td style={tdStyle}>
+                                {operation.machine_name || operation.machine_id}
+                              </td>
+                              <td style={tdStyle}>
+                                {formatPlanInterval(
+                                  operation.planned_start_time,
+                                  operation.planned_end_time
                                 )}
-                            </td>
-                          </tr>
-                        ))}
+                              </td>
+                              <td style={tdStyle}>{operation.quantity ?? 0}</td>
+                              <td style={tdStyle}>
+                                {Number(operation.available_quantity || 0)}
+                              </td>
+                              <td style={tdStyle}>
+                                {operation.good_quantity ?? 0}
+                              </td>
+                              <td style={tdStyle}>
+                                {operation.defect_quantity ?? 0}
+                              </td>
+                              <td style={tdStyle}>{remainingQuantity}</td>
+                              <td style={tdStyle}>
+                                {operation.actual_start_at
+                                  ? new Date(
+                                      operation.actual_start_at
+                                    ).toLocaleString()
+                                  : ""}
+                              </td>
+                              <td style={tdStyle}>
+                                {operation.actual_end_at
+                                  ? new Date(
+                                      operation.actual_end_at
+                                    ).toLocaleString()
+                                  : ""}
+                              </td>
+                              <td style={tdStyle}>
+                                {MES_OPERATION_STATUS_LABELS[
+                                  operation.status
+                                ] || operation.status}
+                              </td>
+                              <td style={tdStyle}>
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    gap: "6px",
+                                    flexWrap: "wrap",
+                                  }}
+                                >
+                                  {operation.id && (
+                                    <button
+                                      onClick={() =>
+                                        handleOpenMesOperationReports(operation)
+                                      }
+                                      style={{
+                                        padding: "4px 8px",
+                                        cursor: "pointer",
+                                      }}
+                                    >
+                                      Журнал
+                                    </button>
+                                  )}
+
+                                  {selectedMesRun.status === "created" &&
+                                    operation.status !== "excluded" && (
+                                      <button
+                                        onClick={() =>
+                                          handleExcludeMesOrderItem(
+                                            selectedMesRun.id,
+                                            operation.order_item_id
+                                          )
+                                        }
+                                        style={{
+                                          padding: "4px 8px",
+                                          cursor: "pointer",
+                                        }}
+                                      >
+                                        Исключить позицию
+                                      </button>
+                                    )}
+
+                                  {selectedMesRun.status === "created" &&
+                                    operation.status === "excluded" && (
+                                      <button
+                                        onClick={() =>
+                                          handleIncludeMesOrderItem(
+                                            selectedMesRun.id,
+                                            operation.order_item_id
+                                          )
+                                        }
+                                        style={{
+                                          padding: "4px 8px",
+                                          cursor: "pointer",
+                                        }}
+                                      >
+                                        Вернуть позицию
+                                      </button>
+                                    )}
+
+                                  {canStartOperation && (
+                                    <button
+                                      onClick={() =>
+                                        handleStartMesOperation(operation.id)
+                                      }
+                                      style={{
+                                        padding: "4px 8px",
+                                        cursor: "pointer",
+                                      }}
+                                    >
+                                      Начать
+                                    </button>
+                                  )}
+
+                                  {operation.status === "in_work" && (
+                                    <button
+                                      onClick={() =>
+                                        handleCompleteMesOperation(operation)
+                                      }
+                                      style={{
+                                        padding: "4px 8px",
+                                        cursor: "pointer",
+                                      }}
+                                    >
+                                      Зафиксировать выполнение
+                                    </button>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
                 ))}
               </div>
             )}
+
+            {selectedMesOperationForReports && (
+              <div
+                style={{
+                  marginTop: "16px",
+                  border: "1px solid #ccc",
+                  padding: "12px",
+                  background: "#fafafa",
+                  overflowX: "auto",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: "12px",
+                    alignItems: "center",
+                    marginBottom: "8px",
+                  }}
+                >
+                  <h3 style={{ margin: 0 }}>Журнал выполнения операции</h3>
+
+                  <button
+                    onClick={handleCloseMesOperationReports}
+                    style={{ padding: "4px 8px", cursor: "pointer" }}
+                  >
+                    Закрыть
+                  </button>
+                </div>
+
+                <div style={{ marginBottom: "10px", fontSize: "14px" }}>
+                  <div>
+                    <b>Заказ:</b>{" "}
+                    {selectedMesOperationForReports.order_no || ""}
+                  </div>
+                  <div>
+                    <b>Изделие:</b>{" "}
+                    {selectedMesOperationForReports.product_name || ""}
+                  </div>
+                  <div>
+                    <b>Операция:</b>{" "}
+                    {selectedMesOperationForReports.operation_name ||
+                      selectedMesOperationForReports.operation_type ||
+                      ""}
+                  </div>
+                  <div>
+                    <b>Станок:</b>{" "}
+                    {selectedMesOperationForReports.machine_name ||
+                      selectedMesOperationForReports.machine_id ||
+                      ""}
+                  </div>
+                  <div>
+                    <b>Статус:</b>{" "}
+                    {MES_OPERATION_STATUS_LABELS[
+                      selectedMesOperationForReports.status
+                    ] ||
+                      selectedMesOperationForReports.status ||
+                      ""}
+                  </div>
+                  <div>
+                    <b>Количество:</b> план{" "}
+                    {Number(selectedMesOperationForReports.quantity || 0)},
+                    годно{" "}
+                    {Number(
+                      selectedMesOperationForReports.good_quantity || 0
+                    )}
+                    , брак{" "}
+                    {Number(
+                      selectedMesOperationForReports.defect_quantity || 0
+                    )}
+                    , доступно{" "}
+                    {Number(
+                      selectedMesOperationForReports.available_quantity || 0
+                    )}
+                    , остаток{" "}
+                    {Math.max(
+                      Number(selectedMesOperationForReports.quantity || 0) -
+                        Number(
+                          selectedMesOperationForReports.good_quantity || 0
+                        ),
+                      0
+                    )}
+                  </div>
+                </div>
+
+                {isReportsLoading ? (
+                  <div>Журнал загружается...</div>
+                ) : selectedMesOperationReports.length === 0 ? (
+                  <div style={{ color: "#777" }}>
+                    По этой операции пока нет записей выполнения
+                  </div>
+                ) : (
+                  <table
+                    style={{
+                      width: "100%",
+                      borderCollapse: "collapse",
+                      fontSize: "14px",
+                    }}
+                  >
+                    <thead>
+                      <tr>
+                        <th style={thStyle}>№</th>
+                        <th style={thStyle}>ID записи</th>
+                        <th style={thStyle}>Тип</th>
+                        <th style={thStyle}>Начало</th>
+                        <th style={thStyle}>Окончание</th>
+                        <th style={thStyle}>Годно</th>
+                        <th style={thStyle}>Брак</th>
+                        <th style={thStyle}>Комментарий</th>
+                        <th style={thStyle}>Причина исправления</th>
+                        <th style={thStyle}>Кто ввёл</th>
+                        <th style={thStyle}>Создано</th>
+                        <th style={thStyle}>Действие</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {selectedMesOperationReports.map((report, index) => {
+                        const isCorrection =
+                          report.report_type === "correction";
+                        const correctedIndex =
+                          report.corrected_report_id == null
+                            ? -1
+                            : selectedMesOperationReports.findIndex(
+                                (candidate) =>
+                                  String(candidate.id ?? candidate.report_id) ===
+                                  String(report.corrected_report_id)
+                              );
+                        const reportRowStyle = isCorrection
+                          ? { background: "#fff3cd" }
+                          : {};
+
+                        return (
+                          <tr key={report.id || index} style={reportRowStyle}>
+                            <td style={tdStyle}>{index + 1}</td>
+                            <td style={tdStyle}>
+                              {report.id ?? report.report_id ?? ""}
+                            </td>
+                            <td style={tdStyle}>
+                              {MES_REPORT_TYPE_LABELS[report.report_type] ||
+                                report.report_type ||
+                                "выполнение"}
+                            </td>
+                            <td style={tdStyle}>
+                              {formatDateTime(report.started_at)}
+                            </td>
+                            <td style={tdStyle}>
+                              {formatDateTime(report.ended_at)}
+                            </td>
+                            <td style={tdStyle}>
+                              {Number(report.good_quantity || 0)}
+                            </td>
+                            <td style={tdStyle}>
+                              {Number(report.defect_quantity || 0)}
+                            </td>
+                            <td style={tdStyle}>{report.comment || ""}</td>
+                            <td style={tdStyle}>
+                              {isCorrection && report.corrected_report_id
+                                ? `Исправляет строку ${
+                                    correctedIndex >= 0
+                                      ? correctedIndex + 1
+                                      : "?"
+                                  } (ID ${
+                                    report.corrected_report_id
+                                  }). `
+                                : ""}
+                              {report.correction_reason || ""}
+                            </td>
+                            <td style={tdStyle}>{report.reported_by || ""}</td>
+                            <td style={tdStyle}>
+                              {formatDateTime(report.created_at)}
+                            </td>
+                            <td style={tdStyle}>
+                              {!isCorrection && (
+                                <button
+                                  onClick={() =>
+                                    handleCorrectMesOperationReport(report)
+                                  }
+                                  style={{
+                                    padding: "4px 8px",
+                                    cursor: "pointer",
+                                  }}
+                                >
+                                  Исправить
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            )}
           </div>
         )}
+
+        <div
+          style={{
+            marginTop: "16px",
+            border: "1px solid #ccc",
+            padding: "12px",
+            background: "#fafafa",
+          }}
+        >
+          <h3 style={{ marginTop: 0 }}>Сменный отчёт мастера</h3>
+
+          <div
+            style={{
+              display: "flex",
+              gap: "8px",
+              alignItems: "center",
+              flexWrap: "wrap",
+              marginBottom: "12px",
+            }}
+          >
+            <span>День:</span>
+            <input
+              type="number"
+              min="1"
+              value={shiftReportDay}
+              onChange={(e) => setShiftReportDay(e.target.value)}
+              style={{ width: "80px", padding: "6px" }}
+            />
+
+            <span>Смена:</span>
+            <select
+              value={shiftReportShift}
+              onChange={(e) => setShiftReportShift(e.target.value)}
+              style={{ padding: "6px" }}
+            >
+              <option value="1">Смена 1, 08:00–19:00</option>
+              <option value="2">Смена 2, 20:00–07:00</option>
+            </select>
+
+            <button
+              onClick={handleLoadShiftReport}
+              style={{ padding: "6px 10px", cursor: "pointer" }}
+            >
+              Показать отчёт
+            </button>
+          </div>
+
+          {shiftReport && (
+            <div
+              style={{
+                display: "flex",
+                gap: "16px",
+                flexWrap: "wrap",
+                marginBottom: "12px",
+                padding: "8px",
+                background: "#f7f7f7",
+                border: "1px solid #ddd",
+              }}
+            >
+              <span>
+                Период: {formatDateTime(shiftReport.shift_start)} —{" "}
+                {formatDateTime(shiftReport.shift_end)}
+              </span>
+              <span>
+                Участок: {shiftReport.workshop?.name || "Все участки"}
+              </span>
+              {shiftReport.workshop?.responsible_name && (
+                <span>
+                  Ответственный: {shiftReport.workshop.responsible_name}
+                </span>
+              )}
+              <span>
+                Записей факта: {shiftReport.summary?.reports_count ?? 0}
+              </span>
+              <span>
+                Операций: {shiftReport.summary?.operations_count ?? 0}
+              </span>
+              <span>Годно: {shiftReport.summary?.good_quantity ?? 0}</span>
+              <span>Брак: {shiftReport.summary?.defect_quantity ?? 0}</span>
+            </div>
+          )}
+
+          {isShiftReportLoading ? (
+            <div>Сменный отчёт загружается...</div>
+          ) : shiftReport &&
+            Array.isArray(shiftReport.reports) &&
+            shiftReport.reports.length === 0 ? (
+            <div style={{ color: "#777" }}>
+              За выбранную смену фактических записей нет
+            </div>
+          ) : shiftReport && Array.isArray(shiftReport.reports) ? (
+            <div style={{ overflowX: "auto" }}>
+              <table
+                style={{
+                  width: "100%",
+                  borderCollapse: "collapse",
+                  fontSize: "14px",
+                }}
+              >
+                <thead>
+                  <tr>
+                    <th style={thStyle}>№</th>
+                    <th style={thStyle}>ID записи</th>
+                    <th style={thStyle}>Тип</th>
+                    <th style={thStyle}>Задание</th>
+                    <th style={thStyle}>Заказ</th>
+                    <th style={thStyle}>Изделие</th>
+                    <th style={thStyle}>Участок</th>
+                    <th style={thStyle}>Операция</th>
+                    <th style={thStyle}>Станок</th>
+                    <th style={thStyle}>Начало</th>
+                    <th style={thStyle}>Окончание</th>
+                    <th style={thStyle}>Годно</th>
+                    <th style={thStyle}>Брак</th>
+                    <th style={thStyle}>Комментарий</th>
+                    <th style={thStyle}>Причина исправления</th>
+                    <th style={thStyle}>Кто ввёл</th>
+                    <th style={thStyle}>Создано</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {shiftReport.reports.map((report, index) => {
+                    const isCorrection = report.report_type === "correction";
+
+                    return (
+                      <tr
+                        key={report.report_id || index}
+                        style={isCorrection ? { background: "#fff3cd" } : {}}
+                      >
+                        <td style={tdStyle}>{index + 1}</td>
+                        <td style={tdStyle}>
+                          {report.report_id ?? report.id ?? ""}
+                        </td>
+                        <td style={tdStyle}>
+                          {MES_REPORT_TYPE_LABELS[report.report_type] ||
+                            report.report_type ||
+                            "выполнение"}
+                        </td>
+                        <td style={tdStyle}>#{report.schedule_run_id}</td>
+                        <td style={tdStyle}>{report.order_no || ""}</td>
+                        <td style={tdStyle}>{report.product_name || ""}</td>
+                        <td style={tdStyle}>
+                          {report.workshop_name || "Без участка"}
+                        </td>
+                        <td style={tdStyle}>
+                          {report.operation_name || report.operation_type || ""}
+                        </td>
+                        <td style={tdStyle}>
+                          {report.machine_name || report.machine_id || ""}
+                        </td>
+                        <td style={tdStyle}>
+                          {formatDateTime(report.started_at)}
+                        </td>
+                        <td style={tdStyle}>
+                          {formatDateTime(report.ended_at)}
+                        </td>
+                        <td style={tdStyle}>
+                          {Number(report.good_quantity || 0)}
+                        </td>
+                        <td style={tdStyle}>
+                          {Number(report.defect_quantity || 0)}
+                        </td>
+                        <td style={tdStyle}>{report.comment || ""}</td>
+                        <td style={tdStyle}>
+                          {isCorrection && report.corrected_report_id
+                            ? `Исправляет запись #${report.corrected_report_id}. `
+                            : ""}
+                          {report.correction_reason || ""}
+                        </td>
+                        <td style={tdStyle}>{report.reported_by || ""}</td>
+                        <td style={tdStyle}>
+                          {formatDateTime(report.created_at)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+        </div>
       </div>
       )}
     </div>

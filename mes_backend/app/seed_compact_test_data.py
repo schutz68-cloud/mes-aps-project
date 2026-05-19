@@ -16,16 +16,13 @@ from app.db import engine, init_db_schema  # noqa: E402
 ACTIVE_PLAN_VERSION_ID = 1
 ROUTE_GAP_MINUTES = 30
 MACHINE_GAP_MINUTES = 15
-COILING_SETUP_RESOURCE_KEY = "COILING"
 
 SETUP_TEAM_BY_MACHINE_GROUP = {
     "COIL_A": "SETUP_COIL",
-    "COIL_B": "SETUP_COIL",
     "BEND": "SETUP_BEND",
     "FACE": "SETUP_FACE",
     "HEAT": "SETUP_HEAT",
     "COAT_A": "SETUP_COAT",
-    "COAT_B": "SETUP_COAT",
 }
 
 SETUP_MINUTES = {
@@ -36,20 +33,12 @@ SETUP_MINUTES = {
     "COATING": 10,
 }
 
-DEFAULT_UNITS_PER_MINUTE = {
-    "COILING": 20,
-    "FACING": 25,
-    "BENDING": 18,
-    "HEAT": 60,
-    "COATING": 40,
-}
-
-MACHINES_BY_OPERATION = {
-    "COILING": ["NW1", "NW2", "NW3", "NW4", "NW5", "NW6"],
-    "FACING": ["TC1", "TC2"],
-    "BENDING": ["ZG1", "ZG2"],
-    "HEAT": ["TM1"],
-    "COATING": ["PK1", "PK2"],
+OPERATION_NAMES = {
+    "COILING": "Навивка",
+    "FACING": "Торцовка",
+    "BENDING": "Загиб",
+    "HEAT": "Термичка",
+    "COATING": "Покрытие",
 }
 
 REQUIRED_GROUP_BY_OPERATION = {
@@ -60,119 +49,136 @@ REQUIRED_GROUP_BY_OPERATION = {
     "COATING": "COAT_A",
 }
 
-ALLOWED_GROUPS_BY_OPERATION = {
-    "COILING": ["COIL_A", "COIL_B"],
-    "FACING": ["FACE"],
-    "BENDING": ["BEND"],
-    "HEAT": ["HEAT"],
-    "COATING": ["COAT_A", "COAT_B"],
+MACHINES_BY_OPERATION = {
+    "COILING": ["NW1", "NW2", "NW3"],
+    "FACING": ["TC1"],
+    "BENDING": ["ZG1"],
+    "HEAT": ["TM1"],
+    "COATING": ["PK1"],
 }
 
-OPERATION_NAMES = {
-    "COILING": "Навивка",
-    "FACING": "Торцовка",
-    "BENDING": "Загиб",
-    "HEAT": "Термичка",
-    "COATING": "Покрытие",
-}
-
-TARGET_PRODUCTS = [
-    ("SPR-01-01", ["%SPR-01-01%", "%ДПЗ-01-01%", "%01-01%"]),
-    ("SPR-02-01", ["%SPR-02-01%", "%ДПЗ-02-01%", "%02-01%"]),
-    ("SPR-01-02", ["%SPR-01-02%", "%ДПЗ-01-02%", "%01-02%"]),
-    ("SPR-02-02", ["%SPR-02-02%", "%ДПЗ-02-02%", "%02-02%"]),
-    ("SPR-01-03", ["%SPR-01-03%", "%ДПЗ-01-03%", "%01-03%"]),
-    ("SPR-02-03", ["%SPR-02-03%", "%ДПЗ-02-03%", "%02-03%"]),
+MACHINE_ROWS = [
+    ("NW1", "COIL_A", "Навивка NW1"),
+    ("NW2", "COIL_A", "Навивка NW2"),
+    ("NW3", "COIL_A", "Навивка NW3"),
+    ("TC1", "FACE", "Торцовка TC1"),
+    ("ZG1", "BEND", "Загиб ZG1"),
+    ("TM1", "HEAT", "Термичка TM1"),
+    ("PK1", "COAT_A", "Покрытие PK1"),
 ]
 
-ORDERS = [
+REMOVED_TEST_MACHINES = ["NW4", "NW5", "NW6", "TC2", "ZG2", "PK2"]
+
+ORDER_ITEMS = [
     {
-        "id": 1,
+        "order_id": 1,
         "order_no": "ORD-001",
-        "product_key": "SPR-01-01",
-        "quantity": 2000,
-        "due_time": 7200,
-        "routing_id": 101,
-        "route": ["COILING", "FACING", "HEAT", "COATING"],
-        "plan": [
-            ("COILING", "NW1", 0),
-            ("FACING", "TC1", 180),
-            ("HEAT", "TM1", 318),
-            ("COATING", "PK1", 383),
-        ],
+        "item_id": 1,
+        "product_key": "SMALL-1",
+        "product_name": "Пружина малая 1",
+        "quantity": 1000,
+        "route": ["COILING", "HEAT", "COATING"],
+        "coiling_rate": 10,
     },
     {
-        "id": 2,
+        "order_id": 2,
         "order_no": "ORD-002",
-        "product_key": "SPR-02-01",
-        "quantity": 2100,
-        "due_time": 8400,
-        "routing_id": 102,
+        "item_id": 2,
+        "product_key": "SMALL-2",
+        "product_name": "Пружина малая 2",
+        "quantity": 1200,
         "route": ["COILING", "FACING", "HEAT", "COATING"],
-        "plan": [
-            ("COILING", "NW2", 0),
-            ("FACING", "TC2", 200),
-            ("HEAT", "TM1", 368),
-            ("COATING", "PK2", 440),
-        ],
+        "coiling_rate": 10,
     },
     {
-        "id": 3,
+        "order_id": 3,
         "order_no": "ORD-003",
-        "product_key": "SPR-01-02",
-        "quantity": 2200,
-        "due_time": 9600,
-        "routing_id": 103,
+        "item_id": 3,
+        "product_key": "SMALL-3",
+        "product_name": "Пружина малая 3",
+        "quantity": 1500,
         "route": ["COILING", "HEAT", "COATING"],
-        "plan": [
-            ("COILING", "NW3", 0),
-            ("HEAT", "TM1", 425),
-            ("COATING", "PK1", 489),
-        ],
+        "coiling_rate": 10,
     },
     {
-        "id": 4,
+        "order_id": 4,
         "order_no": "ORD-004",
-        "product_key": "SPR-02-02",
-        "quantity": 2300,
-        "due_time": 10800,
-        "routing_id": 104,
+        "item_id": 4,
+        "product_key": "MEDIUM-1",
+        "product_name": "Пружина средняя 1",
+        "quantity": 4000,
         "route": ["COILING", "HEAT", "COATING"],
-        "plan": [
-            ("COILING", "NW4", 0),
-            ("HEAT", "TM1", 474),
-            ("COATING", "PK2", 559),
-        ],
+        "coiling_rate": 22,
     },
     {
-        "id": 5,
+        "order_id": 5,
         "order_no": "ORD-005",
-        "product_key": "SPR-01-03",
-        "quantity": 2200,
-        "due_time": 12000,
-        "routing_id": 105,
-        "route": ["COILING", "BENDING", "HEAT", "COATING"],
-        "plan": [
-            ("COILING", "NW5", 0),
-            ("BENDING", "ZG1", 210),
-            ("HEAT", "TM1", 544),
-            ("COATING", "PK1", 619),
-        ],
+        "item_id": 5,
+        "product_key": "MEDIUM-2",
+        "product_name": "Пружина средняя 2",
+        "quantity": 4500,
+        "route": ["COILING", "HEAT", "COATING"],
+        "coiling_rate": 24,
     },
     {
-        "id": 6,
+        "order_id": 6,
         "order_no": "ORD-006",
-        "product_key": "SPR-02-03",
-        "quantity": 2300,
-        "due_time": 13200,
-        "routing_id": 106,
+        "item_id": 6,
+        "product_key": "MEDIUM-3",
+        "product_name": "Пружина средняя 3",
+        "quantity": 5000,
         "route": ["COILING", "BENDING", "HEAT", "COATING"],
-        "plan": [
-            ("COILING", "NW6", 0),
-            ("BENDING", "ZG2", 230),
-            ("HEAT", "TM1", 604),
-            ("COATING", "PK2", 686),
-        ],
+        "coiling_rate": 25,
+    },
+    {
+        "order_id": 7,
+        "order_no": "ORD-007",
+        "item_id": 7,
+        "product_key": "MEDIUM-4",
+        "product_name": "Пружина средняя 4",
+        "quantity": 5500,
+        "route": ["COILING", "HEAT", "COATING"],
+        "coiling_rate": 27,
+    },
+    {
+        "order_id": 8,
+        "order_no": "ORD-008",
+        "item_id": 8,
+        "product_key": "BIG",
+        "product_name": "Пружина большая",
+        "quantity": 3000,
+        "route": ["COILING", "HEAT", "COATING"],
+        "coiling_rate": 12,
+    },
+    {
+        "order_id": 8,
+        "order_no": "ORD-008",
+        "item_id": 9,
+        "product_key": "BIG",
+        "product_name": "РџСЂСѓР¶РёРЅР° Р±РѕР»СЊС€Р°СЏ",
+        "quantity": 3000,
+        "route": ["COILING", "HEAT", "COATING"],
+        "coiling_rate": 12,
+    },
+    {
+        "order_id": 8,
+        "order_no": "ORD-008",
+        "item_id": 10,
+        "product_key": "BIG",
+        "product_name": "РџСЂСѓР¶РёРЅР° Р±РѕР»СЊС€Р°СЏ",
+        "quantity": 3000,
+        "route": ["COILING", "HEAT", "COATING"],
+        "coiling_rate": 12,
+    },
+    {
+        "order_id": 8,
+        "order_no": "ORD-008",
+        "item_id": 11,
+        "product_key": "BIG",
+        "product_name": "РџСЂСѓР¶РёРЅР° Р±РѕР»СЊС€Р°СЏ",
+        "quantity": 1000,
+        "route": ["COILING", "HEAT", "COATING"],
+        "coiling_rate": 12,
     },
 ]
 
@@ -190,6 +196,21 @@ def get_columns(connection, table_name):
         {"table_name": table_name},
     ).scalars()
     return set(rows)
+
+
+def get_column_type(connection, table_name, column_name):
+    return connection.execute(
+        text(
+            """
+            SELECT data_type
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = :table_name
+              AND column_name = :column_name
+            """
+        ),
+        {"table_name": table_name, "column_name": column_name},
+    ).scalar()
 
 
 def insert_row(connection, table_name, values, table_columns):
@@ -227,75 +248,66 @@ def sync_sequence(connection, table_name, id_column="id"):
     )
 
 
-def find_products(connection):
+def product_id_for(index, product_key, product_id_type):
+    if product_id_type in {"integer", "bigint", "smallint"}:
+        return 1000 + index
+    return f"TEST-{product_key}"
+
+
+def build_product_map(connection):
+    product_id_type = get_column_type(connection, "products", "id")
     products = {}
-    used_ids = set()
+    next_index = 1
+    for item in ORDER_ITEMS:
+        if item["product_key"] in products:
+            continue
 
-    for index, (product_key, patterns) in enumerate(TARGET_PRODUCTS):
-        product = None
-        for pattern in patterns:
-            product = connection.execute(
-                text(
-                    """
-                    SELECT id, name
-                    FROM products
-                    WHERE name ILIKE :pattern
-                    ORDER BY id
-                    LIMIT 1
-                    """
-                ),
-                {"pattern": pattern},
-            ).mappings().first()
-            if product and product["id"] not in used_ids:
-                break
-            product = None
-
-        if not product:
-            candidates = connection.execute(
-                text(
-                    """
-                    SELECT id, name
-                    FROM products
-                    ORDER BY id
-                    """
-                )
-            ).mappings().all()
-            product = next(
-                (candidate for candidate in candidates if candidate["id"] not in used_ids),
-                None,
-            )
-
-        if not product:
-            raise RuntimeError(
-                f"Не найдено изделие для {product_key}. Проверьте таблицу products"
-            )
-
-        used_ids.add(product["id"])
-        products[product_key] = dict(product)
+        products[item["product_key"]] = {
+            "id": product_id_for(next_index, item["product_key"], product_id_type),
+            "name": item["product_name"],
+        }
+        next_index += 1
 
     return products
 
 
-def ensure_machines_exist(connection):
-    machine_ids = sorted(
-        {machine_id for machines in MACHINES_BY_OPERATION.values() for machine_id in machines}
-    )
-    existing = set(
-        connection.execute(
-            text("SELECT id FROM machines WHERE id = ANY(:machine_ids)"),
-            {"machine_ids": machine_ids},
-        ).scalars()
-    )
-    missing = sorted(set(machine_ids) - existing)
-    if missing:
-        raise RuntimeError(f"Не найдены станки: {', '.join(missing)}")
-
-    machine_columns = get_columns(connection, "machines")
-    if "status" in machine_columns:
-        connection.execute(
-            text("UPDATE machines SET status = 'active' WHERE id = ANY(:machine_ids)"),
-            {"machine_ids": machine_ids},
+def reset_calendar(connection):
+    connection.execute(text("DELETE FROM shift_template_breaks"))
+    connection.execute(text("DELETE FROM shift_templates"))
+    connection.execute(
+        text(
+            """
+            INSERT INTO shift_templates (
+                id,
+                name,
+                start_minute_of_day,
+                end_minute_of_day,
+                prep_minutes,
+                finish_minutes,
+                is_active
+            )
+            VALUES
+                (1, 'Смена 1', 480, 1140, 0, 0, true),
+                (2, 'Смена 2', 1200, 420, 0, 0, true)
+            """
         )
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO shift_template_breaks (
+                id,
+                shift_template_id,
+                name,
+                start_minute_of_shift,
+                end_minute_of_shift
+            )
+            VALUES
+                (1, 1, 'Обед', 240, 300),
+                (2, 2, 'Обед', 240, 300)
+            """
+        )
+    )
 
 
 def reset_plan_versions(connection):
@@ -315,87 +327,100 @@ def reset_plan_versions(connection):
                 'Основной план',
                 'active',
                 'system',
-                'Текущая активная версия плана'
+                'Тестовая модель: смены 08:00–19:00 и 20:00–07:00'
             )
             ON CONFLICT (id) DO UPDATE
             SET
                 name = EXCLUDED.name,
                 status = EXCLUDED.status,
                 created_by = EXCLUDED.created_by,
-                description = EXCLUDED.description
+                description = EXCLUDED.description,
+                approved_at = NULL,
+                approved_by = NULL
             """
         )
     )
 
 
-def reset_rates(connection, products):
-    operation_types = list(SETUP_MINUTES.keys())
+def reset_machines(connection, columns):
+    machine_columns = columns["machines"]
+    all_test_machine_ids = [row[0] for row in MACHINE_ROWS] + REMOVED_TEST_MACHINES
     connection.execute(
-        text(
-            """
-            UPDATE machine_product_rates
-            SET
-                setup_minutes = CASE operation_type
-                    WHEN 'COILING' THEN 90
-                    WHEN 'FACING' THEN 60
-                    WHEN 'BENDING' THEN 60
-                    WHEN 'HEAT' THEN 15
-                    WHEN 'COATING' THEN 10
-                    ELSE setup_minutes
-                END,
-                units_per_minute = CASE
-                    WHEN units_per_minute IS NULL OR units_per_minute <= 0 THEN
-                        CASE operation_type
-                            WHEN 'COILING' THEN 20
-                            WHEN 'FACING' THEN 25
-                            WHEN 'BENDING' THEN 18
-                            WHEN 'HEAT' THEN 60
-                            WHEN 'COATING' THEN 40
-                            ELSE 1
-                        END
-                    ELSE units_per_minute
-                END
-            WHERE operation_type = ANY(:operation_types)
-            """
-        ),
-        {"operation_types": operation_types},
+        text("DELETE FROM machine_product_rates WHERE machine_id = ANY(:machine_ids)"),
+        {"machine_ids": all_test_machine_ids},
     )
     connection.execute(
-        text(
-            """
-            UPDATE machine_product_rates
-            SET units_per_minute = 1
-            WHERE units_per_minute IS NULL
-               OR units_per_minute <= 0
-            """
+        text("DELETE FROM machines WHERE id = ANY(:machine_ids)"),
+        {"machine_ids": all_test_machine_ids},
+    )
+
+    for machine_id, group_id, name in MACHINE_ROWS:
+        insert_row(
+            connection,
+            "machines",
+            {
+                "id": machine_id,
+                "group_id": group_id,
+                "name": name,
+                "status": "active",
+                "is_active": True,
+            },
+            machine_columns,
         )
-    )
 
-    selected_product_ids = [product["id"] for product in products.values()]
-    all_machine_ids = sorted(
-        {machine_id for machines in MACHINES_BY_OPERATION.values() for machine_id in machines}
+
+def reset_products(connection, columns, products):
+    product_columns = columns["products"]
+    product_ids = [product["id"] for product in products.values()]
+    connection.execute(
+        text("DELETE FROM machine_product_rates WHERE product_id = ANY(:product_ids)"),
+        {"product_ids": product_ids},
     )
     connection.execute(
-        text(
-            """
-            DELETE FROM machine_product_rates
-            WHERE product_id = ANY(:product_ids)
-              AND machine_id = ANY(:machine_ids)
-              AND operation_type = ANY(:operation_types)
-            """
-        ),
-        {
-            "product_ids": selected_product_ids,
-            "machine_ids": all_machine_ids,
-            "operation_types": operation_types,
-        },
+        text("DELETE FROM products WHERE id = ANY(:product_ids)"),
+        {"product_ids": product_ids},
     )
 
-    rate_columns = get_columns(connection, "machine_product_rates")
-    for order in ORDERS:
-        product_id = products[order["product_key"]]["id"]
-        for operation_type in order["route"]:
+    for product in products.values():
+        insert_row(
+            connection,
+            "products",
+            {
+                "id": product["id"],
+                "name": product["name"],
+                "description": product["name"],
+                "status": "active",
+                "is_active": True,
+            },
+            product_columns,
+        )
+
+
+def rate_for(item, operation_type):
+    if operation_type == "COILING":
+        return item["coiling_rate"]
+    if operation_type == "HEAT":
+        return 50
+    if operation_type == "COATING":
+        return 40
+    if operation_type == "FACING":
+        return 25
+    if operation_type == "BENDING":
+        return 25
+    raise RuntimeError(f"Неизвестный тип операции: {operation_type}")
+
+
+def reset_rates(connection, columns, products):
+    rate_columns = columns["machine_product_rates"]
+    created_rates = set()
+    for item in ORDER_ITEMS:
+        product_id = products[item["product_key"]]["id"]
+        for operation_type in item["route"]:
             for machine_id in MACHINES_BY_OPERATION[operation_type]:
+                rate_key = (product_id, machine_id, operation_type)
+                if rate_key in created_rates:
+                    continue
+
                 insert_row(
                     connection,
                     "machine_product_rates",
@@ -403,44 +428,48 @@ def reset_rates(connection, products):
                         "product_id": product_id,
                         "machine_id": machine_id,
                         "operation_type": operation_type,
-                        "units_per_minute": DEFAULT_UNITS_PER_MINUTE[operation_type],
+                        "units_per_minute": rate_for(item, operation_type),
                         "setup_minutes": SETUP_MINUTES[operation_type],
                     },
                     rate_columns,
                 )
+                created_rates.add(rate_key)
 
 
 def create_orders(connection, columns, products):
     order_columns = columns["orders"]
     order_item_columns = columns["order_items"]
+    created_orders = set()
 
-    for order in ORDERS:
+    for item in ORDER_ITEMS:
         due_values = {
-            "due_date": order["due_time"],
-            "due_time": order["due_time"],
+            "due_date": 10080,
+            "due_time": 10080,
         }
-        insert_row(
-            connection,
-            "orders",
-            {
-                "id": order["id"],
-                "order_no": order["order_no"],
-                "customer": "Тестовый заказчик",
-                "status": "created",
-                **due_values,
-            },
-            order_columns,
-        )
+        if item["order_id"] not in created_orders:
+            insert_row(
+                connection,
+                "orders",
+                {
+                    "id": item["order_id"],
+                    "order_no": item["order_no"],
+                    "customer": "Тестовый заказчик",
+                    "status": "created",
+                    **due_values,
+                },
+                order_columns,
+            )
+            created_orders.add(item["order_id"])
 
         insert_row(
             connection,
             "order_items",
             {
-                "id": order["id"],
-                "order_id": order["id"],
-                "product_id": products[order["product_key"]]["id"],
-                "quantity": order["quantity"],
-                "priority": 1,
+                "id": item["item_id"],
+                "order_id": item["order_id"],
+                "product_id": products[item["product_key"]]["id"],
+                "quantity": item["quantity"],
+                "priority": item["item_id"],
                 **due_values,
             },
             order_item_columns,
@@ -451,64 +480,61 @@ def create_routings(connection, columns, products):
     routing_columns = columns["routings"]
     routing_operation_columns = columns["routing_operations"]
     allowed_columns = columns["routing_operation_machine_groups"]
-
     routing_operation_by_key = {}
     next_routing_operation_id = 1001
 
-    for order in ORDERS:
-        product_id = products[order["product_key"]]["id"]
+    for item in ORDER_ITEMS:
+        routing_id = 1000 + item["item_id"]
         insert_row(
             connection,
             "routings",
             {
-                "id": order["routing_id"],
-                "product_id": product_id,
-                "name": f"Маршрут {order['order_no']}",
+                "id": routing_id,
+                "product_id": products[item["product_key"]]["id"],
+                "name": f"Маршрут {item['order_no']} / {item['product_name']}",
                 "status": "active",
                 "is_active": True,
             },
             routing_columns,
         )
 
-        for index, operation_type in enumerate(order["route"], start=1):
+        for index, operation_type in enumerate(item["route"], start=1):
             routing_operation_id = next_routing_operation_id
             next_routing_operation_id += 1
-            step_no = index * 10
+            sequence_no = index * 10
+            machine_group_id = REQUIRED_GROUP_BY_OPERATION[operation_type]
 
             insert_row(
                 connection,
                 "routing_operations",
                 {
                     "id": routing_operation_id,
-                    "routing_id": order["routing_id"],
-                    "step_no": step_no,
-                    "sequence_no": step_no,
+                    "routing_id": routing_id,
+                    "step_no": sequence_no,
+                    "sequence_no": sequence_no,
                     "operation_type": operation_type,
                     "operation_name": OPERATION_NAMES[operation_type],
-                    "required_machine_group_id": REQUIRED_GROUP_BY_OPERATION[
-                        operation_type
-                    ],
+                    "required_machine_group_id": machine_group_id,
                     "is_mandatory": True,
                     "transfer_batch_allowed": False,
-                    "buffer_minutes": 30,
+                    "buffer_minutes": ROUTE_GAP_MINUTES,
                 },
                 routing_operation_columns,
             )
-            routing_operation_by_key[(order["id"], operation_type)] = {
+            routing_operation_by_key[(item["item_id"], operation_type)] = {
                 "id": routing_operation_id,
-                "sequence_no": step_no,
+                "sequence_no": sequence_no,
             }
 
-            for machine_group_id in ALLOWED_GROUPS_BY_OPERATION[operation_type]:
-                insert_row(
-                    connection,
-                    "routing_operation_machine_groups",
-                    {
-                        "routing_operation_id": routing_operation_id,
-                        "machine_group_id": machine_group_id,
-                    },
-                    allowed_columns,
-                )
+            insert_row(
+                connection,
+                "routing_operation_machine_groups",
+                {
+                    "routing_operation_id": routing_operation_id,
+                    "machine_group_id": machine_group_id,
+                },
+                allowed_columns,
+            )
 
     return routing_operation_by_key
 
@@ -518,9 +544,11 @@ def create_order_operations(connection, columns, routing_operation_by_key):
     order_operation_by_key = {}
     next_order_operation_id = 1
 
-    for order in ORDERS:
-        for operation_type in order["route"]:
-            routing_operation = routing_operation_by_key[(order["id"], operation_type)]
+    for item in ORDER_ITEMS:
+        for operation_type in item["route"]:
+            routing_operation = routing_operation_by_key[
+                (item["item_id"], operation_type)
+            ]
             order_operation_id = next_order_operation_id
             next_order_operation_id += 1
 
@@ -529,18 +557,134 @@ def create_order_operations(connection, columns, routing_operation_by_key):
                 "order_operations",
                 {
                     "id": order_operation_id,
-                    "order_item_id": order["id"],
+                    "order_item_id": item["item_id"],
                     "routing_operation_id": routing_operation["id"],
                     "operation_type": operation_type,
                     "sequence_no": routing_operation["sequence_no"],
-                    "quantity": order["quantity"],
+                    "quantity": item["quantity"],
                     "status": "created",
                 },
                 order_operation_columns,
             )
-            order_operation_by_key[(order["id"], operation_type)] = order_operation_id
+            order_operation_by_key[(item["item_id"], operation_type)] = order_operation_id
 
     return order_operation_by_key
+
+
+def build_work_intervals(days):
+    intervals = []
+    for day in range(days):
+        day_offset = day * 1440
+        intervals.extend(
+            [
+                (day_offset + 0, day_offset + 240),
+                (day_offset + 300, day_offset + 660),
+                (day_offset + 720, day_offset + 960),
+                (day_offset + 1020, day_offset + 1380),
+            ]
+        )
+    return intervals
+
+
+def overlaps(start_a, end_a, start_b, end_b):
+    return start_a < end_b and start_b < end_a
+
+
+def find_conflict_end(intervals, start, end, gap_after=0):
+    conflicting_ends = [
+        busy_end + gap_after
+        for busy_start, busy_end in intervals
+        if overlaps(start, end, busy_start, busy_end + gap_after)
+    ]
+    return max(conflicting_ends) if conflicting_ends else None
+
+
+def is_working_minute_local(minute, work_intervals):
+    return any(start <= minute < end for start, end in work_intervals)
+
+
+def next_working_start(start, work_intervals):
+    candidate = int(start)
+    for _ in range(14 * 1440):
+        if is_working_minute_local(candidate, work_intervals):
+            return candidate
+        candidate += 1
+
+    raise RuntimeError("Не удалось найти рабочее время смены")
+
+
+def add_working_minutes_local(start, duration, work_intervals):
+    cursor = int(start)
+    remaining = int(duration)
+
+    if remaining <= 0:
+        return cursor
+
+    for interval_start, interval_end in work_intervals:
+        if interval_end <= cursor:
+            continue
+
+        if cursor < interval_start:
+            cursor = interval_start
+
+        if interval_start <= cursor < interval_end:
+            available = interval_end - cursor
+            if remaining <= available:
+                return cursor + remaining
+            remaining -= available
+            cursor = interval_end
+
+    raise RuntimeError(
+        f"Не удалось добавить {duration} рабочих минут от старта {start}"
+    )
+
+
+def find_earliest_start(
+    earliest_start,
+    duration,
+    setup_minutes,
+    machine_id,
+    setup_team_id,
+    work_intervals,
+    machine_busy,
+    setup_team_busy,
+):
+    for work_start, work_end in work_intervals:
+        candidate_start = max(int(earliest_start), int(work_start))
+
+        while True:
+            candidate_end = candidate_start + duration
+
+            if candidate_end > work_end:
+                break
+
+            machine_conflict_end = find_conflict_end(
+                machine_busy.get(machine_id, []),
+                candidate_start,
+                candidate_end,
+                MACHINE_GAP_MINUTES,
+            )
+            if machine_conflict_end is not None:
+                candidate_start = machine_conflict_end
+                continue
+
+            if setup_minutes > 0 and setup_team_id:
+                setup_conflict_end = find_conflict_end(
+                    setup_team_busy.get(setup_team_id, []),
+                    candidate_start,
+                    candidate_start + setup_minutes,
+                    MACHINE_GAP_MINUTES,
+                )
+                if setup_conflict_end is not None:
+                    candidate_start = setup_conflict_end
+                    continue
+
+            return candidate_start
+
+    raise RuntimeError(
+        "Не удалось найти рабочий интервал смены для операции "
+        f"machine_id={machine_id}, earliest_start={earliest_start}, duration={duration}"
+    )
 
 
 def get_rate(connection, product_id, operation_type, machine_id):
@@ -561,125 +705,50 @@ def get_rate(connection, product_id, operation_type, machine_id):
             "machine_id": machine_id,
         },
     ).mappings().first()
-
     if not rate:
         raise RuntimeError(
-            "Не найдена норма для "
-            f"product_id={product_id}, machine_id={machine_id}, "
-            f"operation_type={operation_type}"
+            f"Не найдена норма: product_id={product_id}, "
+            f"machine_id={machine_id}, operation_type={operation_type}"
         )
 
     units_per_minute = float(rate["units_per_minute"] or 0)
     if units_per_minute <= 0:
         raise RuntimeError(
-            "Некорректная норма для "
-            f"product_id={product_id}, machine_id={machine_id}, "
-            f"operation_type={operation_type}"
+            f"Некорректная норма: product_id={product_id}, "
+            f"machine_id={machine_id}, operation_type={operation_type}"
         )
 
     return units_per_minute, int(rate["setup_minutes"] or 0)
 
 
 def get_machine_group(connection, machine_id):
-    machine_group_id = connection.execute(
+    return connection.execute(
         text("SELECT group_id FROM machines WHERE id = :machine_id"),
         {"machine_id": machine_id},
     ).scalar()
 
-    if not machine_group_id:
-        raise RuntimeError(f"Не найдена группа оборудования для станка {machine_id}")
 
-    return machine_group_id
-
-
-def build_work_intervals(days: int):
-    intervals = []
-
-    for day in range(days):
-        day_offset = day * 1440
-        intervals.extend(
-            [
-                (day_offset + 20, day_offset + 240),
-                (day_offset + 270, day_offset + 460),
-                (day_offset + 500, day_offset + 720),
-                (day_offset + 750, day_offset + 940),
-            ]
-        )
-
-    return intervals
-
-
-def overlaps(start_a, end_a, start_b, end_b):
-    return start_a < end_b and start_b < end_a
-
-
-def has_overlap(intervals, start, end, gap_after=0):
-    return any(
-        overlaps(start, end, busy_start, busy_end + gap_after)
-        for busy_start, busy_end in intervals
-    )
-
-
-def find_conflict_end(intervals, start, end, gap_after=0):
-    conflicting_ends = [
-        busy_end + gap_after
-        for busy_start, busy_end in intervals
-        if overlaps(start, end, busy_start, busy_end + gap_after)
-    ]
-
-    return max(conflicting_ends) if conflicting_ends else None
-
-
-def find_earliest_start(
+def choose_machine_and_start(
+    connection,
+    product_id,
+    operation_type,
     earliest_start,
-    duration,
-    setup_minutes,
-    machine_id,
-    setup_team_id,
     work_intervals,
     machine_busy,
     setup_team_busy,
+    fixed_machine_id=None,
 ):
-    for work_start, work_end in work_intervals:
-        candidate_start = max(earliest_start, work_start)
+    for machine_id in MACHINES_BY_OPERATION[operation_type]:
+        if fixed_machine_id is not None and machine_id != fixed_machine_id:
+            continue
 
-        while True:
-            candidate_end = candidate_start + duration
-
-            if candidate_end > work_end:
-                break
-
-            machine_conflict_end = find_conflict_end(
-                machine_busy.get(machine_id, []),
-                candidate_start,
-                candidate_end,
-                MACHINE_GAP_MINUTES,
-            )
-            if machine_conflict_end is not None:
-                candidate_start = machine_conflict_end
-                if candidate_start + duration > work_end:
-                    break
-                continue
-
-            if setup_minutes > 0 and setup_team_id:
-                setup_conflict_end = find_conflict_end(
-                    setup_team_busy.get(setup_team_id, []),
-                    candidate_start,
-                    candidate_start + setup_minutes,
-                    MACHINE_GAP_MINUTES,
-                )
-                if setup_conflict_end is not None:
-                    candidate_start = setup_conflict_end
-                    if candidate_start + duration > work_end:
-                        break
-                    continue
-
-            return candidate_start
-
-    raise RuntimeError(
-        "Не удалось найти рабочий интервал для операции "
-        f"machine_id={machine_id}, earliest_start={earliest_start}, duration={duration}"
-    )
+        units_per_minute, setup_minutes = get_rate(
+            connection,
+            product_id,
+            operation_type,
+            machine_id,
+        )
+        yield machine_id, units_per_minute, setup_minutes
 
 
 def create_plan_operations(connection, columns, products, order_operation_by_key):
@@ -687,50 +756,77 @@ def create_plan_operations(connection, columns, products, order_operation_by_key
     order_item_ready_time = {}
     machine_busy = {}
     setup_team_busy = {}
-    work_intervals = build_work_intervals(days=10)
-    max_work_interval_duration = max(
-        work_end - work_start for work_start, work_end in work_intervals
-    )
+    setup_seen = set()
+    setup_ready_time = {}
+    setup_machine_by_key = {}
+    work_intervals = build_work_intervals(days=14)
 
-    for order in ORDERS:
-        product_id = products[order["product_key"]]["id"]
-        for operation_index, (operation_type, machine_id, _planned_start_time) in enumerate(
-            order["plan"]
-        ):
-            units_per_minute, setup_minutes = get_rate(
+    for item in ORDER_ITEMS:
+        product_id = products[item["product_key"]]["id"]
+        for operation_type in item["route"]:
+            operation_id = order_operation_by_key[(item["item_id"], operation_type)]
+            route_ready = order_item_ready_time.get(item["item_id"], 0)
+            if item["item_id"] in order_item_ready_time:
+                route_ready += ROUTE_GAP_MINUTES
+
+            best = None
+            setup_key = (item["order_id"], operation_type, product_id)
+            for machine_id, units_per_minute, setup_minutes in choose_machine_and_start(
                 connection,
                 product_id,
                 operation_type,
-                machine_id,
-            )
-            duration = ceil(order["quantity"] / units_per_minute) + setup_minutes
-            operation_id = order_operation_by_key[(order["id"], operation_type)]
-
-            if duration > max_work_interval_duration:
-                raise RuntimeError(
-                    f"Операция {operation_id} длительностью {duration} мин. "
-                    "не помещается ни в один рабочий интервал смены. "
-                    "Уменьшите количество или увеличьте норму."
-                )
-
-            order_item_id = order["id"]
-            route_ready = order_item_ready_time.get(order_item_id, 0)
-            machine_group_id = get_machine_group(connection, machine_id)
-            setup_team_id = SETUP_TEAM_BY_MACHINE_GROUP.get(machine_group_id)
-
-            if order_item_id in order_item_ready_time:
-                route_ready += ROUTE_GAP_MINUTES
-
-            start_time = find_earliest_start(
                 route_ready,
-                duration,
-                setup_minutes,
-                machine_id,
-                setup_team_id,
                 work_intervals,
                 machine_busy,
                 setup_team_busy,
-            )
+                setup_machine_by_key.get(setup_key),
+            ):
+                is_first_setup_for_key = setup_key not in setup_seen
+                planned_setup_minutes = (
+                    setup_minutes if is_first_setup_for_key else 0
+                )
+                duration = ceil(item["quantity"] / units_per_minute) + planned_setup_minutes
+                candidate_ready = max(
+                    route_ready,
+                    setup_ready_time.get(setup_key, route_ready),
+                )
+
+                machine_group_id = get_machine_group(connection, machine_id)
+                setup_team_id = SETUP_TEAM_BY_MACHINE_GROUP.get(machine_group_id)
+                start_time = find_earliest_start(
+                    candidate_ready,
+                    duration,
+                    planned_setup_minutes,
+                    machine_id,
+                    setup_team_id,
+                    work_intervals,
+                    machine_busy,
+                    setup_team_busy,
+                )
+                machine_load = len(machine_busy.get(machine_id, []))
+                candidate = (
+                    start_time,
+                    machine_load,
+                    machine_id,
+                    duration,
+                    planned_setup_minutes,
+                    setup_team_id,
+                    setup_key,
+                    is_first_setup_for_key,
+                )
+                if best is None or candidate[:3] < best[:3]:
+                    best = candidate
+
+            (
+                start_time,
+                _machine_load,
+                machine_id,
+                duration,
+                setup_minutes,
+                setup_team_id,
+                setup_key,
+                is_first_setup_for_key,
+            ) = best
             end_time = start_time + duration
 
             insert_row(
@@ -742,28 +838,56 @@ def create_plan_operations(connection, columns, products, order_operation_by_key
                     "machine_id": machine_id,
                     "start_time": start_time,
                     "end_time": end_time,
+                    "setup_minutes": setup_minutes,
                     "is_locked": False,
                     "lock_reason": None,
                 },
                 plan_columns,
             )
-            order_item_ready_time[order_item_id] = end_time
+            order_item_ready_time[item["item_id"]] = end_time
             machine_busy.setdefault(machine_id, []).append((start_time, end_time))
             if setup_minutes > 0 and setup_team_id:
                 setup_team_busy.setdefault(setup_team_id, []).append(
                     (start_time, start_time + setup_minutes)
                 )
+            if is_first_setup_for_key:
+                setup_seen.add(setup_key)
+                setup_machine_by_key[setup_key] = machine_id
+                setup_ready_time[setup_key] = (
+                    start_time + setup_minutes + MACHINE_GAP_MINUTES
+                )
+
+
+def reset_test_data(connection):
+    for table_name in [
+        "mes_operation_reports",
+        "mes_schedule_operations",
+        "mes_schedule_runs",
+        "plan_change_log",
+        "plan_operations",
+        "order_operations",
+        "order_items",
+        "orders",
+        "routing_operation_machine_groups",
+        "routing_operations",
+        "routings",
+    ]:
+        connection.execute(text(f"DELETE FROM {table_name}"))
+
+    reset_plan_versions(connection)
 
 
 def assert_counts(connection):
     expected = {
-        "orders": 6,
-        "order_items": 6,
-        "order_operations": 22,
-        "plan_operations": 22,
+        "orders": 8,
+        "order_items": 11,
+        "order_operations": 35,
+        "plan_operations": 35,
         "plan_change_log": 0,
+        "mes_schedule_runs": 0,
+        "mes_schedule_operations": 0,
+        "mes_operation_reports": 0,
     }
-
     for table_name, expected_count in expected.items():
         actual_count = connection.execute(
             text(f"SELECT COUNT(*) FROM {table_name}")
@@ -774,176 +898,35 @@ def assert_counts(connection):
                 f"получено {actual_count}"
             )
 
-    draft_count = connection.execute(
-        text("SELECT COUNT(*) FROM plan_versions WHERE status <> 'active'")
-    ).scalar()
-    if draft_count != 0:
-        raise RuntimeError(f"Ожидалось 0 draft-версий, получено {draft_count}")
-
-    active_versions = connection.execute(
-        text("SELECT id, status, name FROM plan_versions ORDER BY id")
-    ).mappings().all()
-    if len(active_versions) != 1 or active_versions[0]["id"] != 1:
-        raise RuntimeError("Ожидалась только активная версия плана id=1")
-
-    plan_versions = connection.execute(
+    coiling_machines = connection.execute(
         text(
             """
-            SELECT plan_version_id, COUNT(*) AS operation_count
+            SELECT id
+            FROM machines
+            WHERE group_id LIKE 'COIL%'
+            ORDER BY id
+            """
+        )
+    ).scalars().all()
+    if coiling_machines != ["NW1", "NW2", "NW3"]:
+        raise RuntimeError(
+            "Ожидались только станки навивки NW1, NW2, NW3, "
+            f"получено {coiling_machines}"
+        )
+
+    max_end = connection.execute(
+        text(
+            """
+            SELECT MAX(end_time)
             FROM plan_operations
-            GROUP BY plan_version_id
-            ORDER BY plan_version_id
-            """
-        )
-    ).mappings().all()
-    if len(plan_versions) != 1 or plan_versions[0]["plan_version_id"] != 1:
-        raise RuntimeError("Плановые операции должны быть только в версии плана id=1")
-
-    operation_counts = {
-        row["order_id"]: row["operation_count"]
-        for row in connection.execute(
-            text(
-                """
-                SELECT oi.order_id, COUNT(*) AS operation_count
-                FROM order_items oi
-                JOIN order_operations oo ON oo.order_item_id = oi.id
-                GROUP BY oi.order_id
-                ORDER BY oi.order_id
-                """
-            )
-        ).mappings()
-    }
-    expected_operation_counts = {1: 4, 2: 4, 3: 3, 4: 3, 5: 4, 6: 4}
-    if operation_counts != expected_operation_counts:
-        raise RuntimeError(
-            "Неверное количество операций по заказам: "
-            f"{operation_counts}, ожидалось {expected_operation_counts}"
-        )
-
-    setup_rows = connection.execute(
-        text(
-            """
-            SELECT operation_type, setup_minutes
-            FROM machine_product_rates
-            WHERE operation_type IN ('COILING', 'FACING', 'BENDING', 'HEAT', 'COATING')
-            GROUP BY operation_type, setup_minutes
-            """
-        )
-    ).mappings().all()
-    setups = {}
-    for row in setup_rows:
-        setups.setdefault(row["operation_type"], set()).add(row["setup_minutes"])
-
-    for operation_type, setup_minutes in SETUP_MINUTES.items():
-        if setups.get(operation_type) != {setup_minutes}:
-            raise RuntimeError(
-                f"Для {operation_type} ожидалась наладка {setup_minutes}, "
-                f"получено {setups.get(operation_type)}"
-            )
-
-    bad_rates = connection.execute(
-        text(
-            """
-            SELECT COUNT(*)
-            FROM machine_product_rates
-            WHERE units_per_minute IS NULL
-               OR units_per_minute <= 0
+            WHERE plan_version_id = 1
             """
         )
     ).scalar()
-    if bad_rates != 0:
-        raise RuntimeError(f"Найдены нормы с units_per_minute <= 0: {bad_rates}")
-
-    route_buffer_violations = connection.execute(
-        text(
-            """
-            WITH ordered AS (
-                SELECT
-                    po.plan_version_id,
-                    oi.id AS order_item_id,
-                    oo.id AS operation_id,
-                    oo.sequence_no,
-                    po.start_time,
-                    po.end_time,
-                    LAG(po.end_time) OVER (
-                        PARTITION BY po.plan_version_id, oi.id
-                        ORDER BY oo.sequence_no, oo.id
-                    ) AS previous_end_time
-                FROM plan_operations po
-                JOIN order_operations oo ON oo.id = po.operation_id
-                JOIN order_items oi ON oi.id = oo.order_item_id
-            )
-            SELECT COUNT(*)
-            FROM ordered
-            WHERE previous_end_time IS NOT NULL
-              AND start_time < previous_end_time + :route_gap
-            """
-        ),
-        {"route_gap": ROUTE_GAP_MINUTES},
-    ).scalar()
-    if route_buffer_violations != 0:
+    if int(max_end or 0) <= 1380:
         raise RuntimeError(
-            f"Найдены нарушения маршрутного буфера: {route_buffer_violations}"
-        )
-
-    machine_buffer_violations = connection.execute(
-        text(
-            """
-            WITH ordered AS (
-                SELECT
-                    po.plan_version_id,
-                    po.machine_id,
-                    po.operation_id,
-                    po.start_time,
-                    po.end_time,
-                    mpr.setup_minutes,
-                    oo.order_item_id,
-                    oo.sequence_no,
-                    MIN(oo.sequence_no) OVER (
-                        PARTITION BY po.plan_version_id, oo.order_item_id
-                    ) AS first_sequence_no,
-                    LAG(po.end_time) OVER (
-                        PARTITION BY po.plan_version_id, po.machine_id
-                        ORDER BY po.start_time, po.end_time, po.operation_id
-                    ) AS previous_end_time
-                    ,
-                    LAG(po.start_time) OVER (
-                        PARTITION BY po.plan_version_id, po.machine_id
-                        ORDER BY po.start_time, po.end_time, po.operation_id
-                    ) AS previous_start_time,
-                    LAG(mpr.setup_minutes) OVER (
-                        PARTITION BY po.plan_version_id, po.machine_id
-                        ORDER BY po.start_time, po.end_time, po.operation_id
-                    ) AS previous_setup_minutes
-                FROM plan_operations po
-                JOIN order_operations oo ON oo.id = po.operation_id
-                JOIN order_items oi ON oi.id = oo.order_item_id
-                JOIN machine_product_rates mpr
-                  ON mpr.product_id = oi.product_id
-                 AND mpr.machine_id = po.machine_id
-                 AND mpr.operation_type = oo.operation_type
-            )
-            SELECT COUNT(*)
-            FROM ordered
-            WHERE previous_start_time IS NOT NULL
-              AND (
-                  (
-                      sequence_no = first_sequence_no
-                      AND start_time < previous_start_time + previous_setup_minutes + :machine_gap
-                  )
-                  OR
-                  (
-                      sequence_no <> first_sequence_no
-                      AND start_time < previous_end_time + :machine_gap
-                  )
-              )
-            """
-        ),
-        {"machine_gap": MACHINE_GAP_MINUTES},
-    ).scalar()
-    if machine_buffer_violations != 0:
-        raise RuntimeError(
-            f"Найдены нарушения станочного буфера: {machine_buffer_violations}"
+            "Ожидалось, что план растянется больше чем на две смены "
+            f"по горизонту, max_end={max_end}"
         )
 
 
@@ -951,6 +934,8 @@ def seed_compact_test_data():
     init_db_schema()
 
     table_names = [
+        "products",
+        "machines",
         "orders",
         "order_items",
         "order_operations",
@@ -964,21 +949,13 @@ def seed_compact_test_data():
 
     with engine.begin() as connection:
         columns = {table_name: get_columns(connection, table_name) for table_name in table_names}
+        products = build_product_map(connection)
 
-        connection.execute(text("DELETE FROM plan_change_log"))
-        connection.execute(text("DELETE FROM plan_operations"))
-        connection.execute(text("DELETE FROM order_operations"))
-        connection.execute(text("DELETE FROM order_items"))
-        connection.execute(text("DELETE FROM orders"))
-        connection.execute(text("DELETE FROM routing_operation_machine_groups"))
-        connection.execute(text("DELETE FROM routing_operations"))
-        connection.execute(text("DELETE FROM routings"))
-
-        reset_plan_versions(connection)
-        ensure_machines_exist(connection)
-        products = find_products(connection)
-        reset_rates(connection, products)
-
+        reset_test_data(connection)
+        reset_calendar(connection)
+        reset_machines(connection, columns)
+        reset_products(connection, columns, products)
+        reset_rates(connection, columns, products)
         create_orders(connection, columns, products)
         routing_operation_by_key = create_routings(connection, columns, products)
         order_operation_by_key = create_order_operations(
@@ -990,6 +967,10 @@ def seed_compact_test_data():
 
         for table_name in [
             "plan_versions",
+            "shift_templates",
+            "shift_template_breaks",
+            "products",
+            "machines",
             "orders",
             "order_items",
             "routings",
@@ -998,15 +979,19 @@ def seed_compact_test_data():
             "order_operations",
             "plan_operations",
             "machine_product_rates",
+            "mes_schedule_runs",
+            "mes_schedule_operations",
+            "mes_operation_reports",
         ]:
             sync_sequence(connection, table_name)
 
         assert_counts(connection)
 
-    print("Компактная тестовая модель APS-MES загружена")
-    print("orders=6, order_items=6, order_operations=22, plan_operations=22")
-    print("plan_versions: #1 Основной план active, draft=0")
-    print("plan_change_log=0")
+    print("Новая тестовая модель APS-MES загружена")
+    print("orders=8, order_items=11, order_operations=35, plan_operations=35")
+    print("MES-задания, отчёты и логи очищены")
+    print("Смены: 08:00–19:00 и 20:00–07:00, обеды 12:00–13:00 и 00:00–01:00")
+    print("Станки навивки: NW1, NW2, NW3")
 
 
 if __name__ == "__main__":
